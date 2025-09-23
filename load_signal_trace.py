@@ -6,15 +6,14 @@ import pandas as pd
 import numpy as np
 
 carbon_trace_paths = [
-    "signal_traces/CAISO_5min_2022.csv",
-    "signal_traces/CAISO_5min_2023.csv",
-    "signal_traces/CAISO_5min_2024.csv"
+    "signal_traces/US-TEX-ERCO.csv",
+    "signal_traces/US-CAL-CISO.csv"
 ]
 
 price_trace_paths = [
-    "signal_traces/CAISO_LMP_2022.csv",
-    "signal_traces/CAISO_LMP_2023.csv",
-    "signal_traces/CAISO_LMP_2024.csv"
+    "signal_traces/CAISO-LMP-15min-2020-2025.csv",
+    "signal_traces/PJM-LMP-15min-2020-2025.csv",
+    "signal_traces/ERCOT-LMP-15min-2020-2025.csv"
 ]
 
 def load_signal_trace(filename):
@@ -46,14 +45,36 @@ def load_signal_trace(filename):
     # load the CSV file into a DataFrame
     df = pd.read_csv(path)
 
+    # parse the datetime column and set it as the index
+    if type == 2:
+        # rename the interval_start_utc column to datetime
+        df.rename(columns={"interval_start_utc": "datetime"}, inplace=True)
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    df.set_index('datetime', inplace=True)
+
     # extract the relevant signal column
     if type == 1:  # carbon
-        signal = df["carbon_signal"]
+        signal = df["carbon_intensity_avg"]
     elif type == 2:  # price
-        signal = df["price_signal"]
+        # filter the df to just consider the final year of data (2024)
+        df = df[df.index.year == 2024]
+        # print the df.head
+        # print(df.head())
+        signal = df["lmp"]
+        # if there are any negative prices, set them to one
+        signal[signal < 1.0] = 1.0
+
     else:
         raise ValueError("Unknown signal type.")
 
     p_min = signal.min()
+    # get the 99th percentile of the signal to avoid outliers
+    p_99 = signal.quantile(0.99).copy()
+    # cap the signal at the 99th percentile
+    signal[signal > p_99] = p_99
     p_max = signal.max()
-    return signal, p_min, p_max
+
+    # extract the sequence of datetime indexes
+    datetime_index = signal.index
+
+    return signal, datetime_index, p_min, p_max

@@ -12,9 +12,11 @@ def optimal_solution(
     S: float,
     b: list[float],
     f: list[float],
-    s_0: float,
+    Delta_f: list[float],
+    s_0: float = 0.0,
     x_0: float = 0.0,
-    z_0: float = 0.0
+    z_0: float = 0.0,
+    solver_timeout: float = 120.0
 ):
     """
     Solves an offline version of the OSDM problem using Gurobi.
@@ -27,8 +29,9 @@ def optimal_solution(
         c_delivery (float): Parameter for the discharge cost function.
         eps_delivery (float): Parameter for the discharge cost function (eps_delivery < c_delivery).
         S (float): Maximum capacity of the inventory.
-        b (list): A list of lower bounds b_t for z_t for t in [1, T].
-        f (list): A list of values f_t for the upper bound on z_t.
+        b (list): A list of lower bounds b_t for z_t for t in [1, T]. (base demand values)
+        f (list): A list of values f_t for the upper bound on z_t. (flexible demand values)
+        Delta_f (list): A list of deadline values -- f[i] must be delivered by time Delta_f[i].
         s_0 (float): Initial state of the inventory.
         x_0 (float): Initial charge value at t=0.
         z_0 (float): Initial discharge value at t=0.
@@ -39,7 +42,7 @@ def optimal_solution(
         - results (dict): A dictionary with the optimal values for x, z, s,
                           and the objective value. Returns None if no solution is found.
     """
-    if not (len(p) == T and len(b) == T and len(f) == T):
+    if not (len(p) == T and len(b) == T and len(f) == T and len(Delta_f) == T):
         raise ValueError("Length of price and bound lists must equal T.")
 
     # --- Model Setup ---
@@ -54,6 +57,7 @@ def optimal_solution(
     p_map = {t: p[t-1] for t in time_steps}
     b_map = {t: b[t-1] for t in time_steps}
     f_map = {t: f[t-1] for t in time_steps}
+    Delta_f_map = {t: Delta_f[t-1] for t in time_steps}
     f_cumulative = {t: sum(f_map[tau] for tau in range(1, t + 1)) for t in time_steps}
 
 
@@ -81,6 +85,15 @@ def optimal_solution(
     model.addConstrs(
         (z[t] <= b_map[t] + f_cumulative[t] for t in time_steps), name="z_upper_bound"
     )
+    # one additional lower bound on z_t -- the cumulative sum of z_t up to time t should be at least
+    # the cumulative sum of all b_t (satisfied by z_lower_bound constraint) plus all f_t where Delta_f_t <= t
+    model.addConstrs(
+        (gp.quicksum(z[tau] for tau in range(1, t + 1)) >=
+         gp.quicksum(b_map[tau] for tau in range(1, t + 1)) +
+         gp.quicksum(f_map[tau] for tau in time_steps if Delta_f_map[tau] <= t)
+         for t in time_steps),
+        name="z_cumulative_lower_bound"
+    )
     
     # Absolute value linearization constraints
     model.addConstr(dx_abs[1] >= x[1] - x_0, name="dx_abs_pos_t1")
@@ -99,15 +112,6 @@ def optimal_solution(
     model.addConstrs(
         (dz_abs[t] >= -(z[t] - z[t-1]) for t in time_steps if t > 1), name="dz_abs_neg"
     )
-
-    # --- NEW CONSTRAINT ---
-    # The total delivered amount (sum of z) must meet the total flexible demand (sum of f)
-    total_f_demand = sum(f)
-    model.addConstr(
-        gp.quicksum(z[t] for t in time_steps) >= total_f_demand,
-        name="total_demand_met"
-    )
-    # --- END NEW CONSTRAINT ---
 
 
     # --- Objective Function ---
@@ -128,8 +132,10 @@ def optimal_solution(
     model.setObjective(linear_obj + quadratic_obj, GRB.MINIMIZE)
 
     # --- Solver Configuration ---
-    model.setParam('NonConvex', 2)
     model.setParam('OutputFlag', 0)
+    model.setParam('NonConvex', 2)
+    # set a time limit of 60 seconds
+    model.setParam('TimeLimit', solver_timeout)
 
     # --- Solve and Post-process ---
     model.optimize()

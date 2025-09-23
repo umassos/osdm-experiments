@@ -1,55 +1,140 @@
+from load_signal_trace import load_signal_trace
+import trace_loader
 import numpy as np
+import pickle
+import opt_sol as opt_sol
 
+ctx = trace_loader.prepare_exploded_from_csv("demand_traces/batch_task.csv", bucket_minutes=15)
 
-
-# implements the OSDM objective function outside of Gurobi 
-def objective_function(
-    T: int,
-    p: list[float],
-    gamma: float,
-    delta: float,
-    c_delivery: float,
-    eps_delivery: float,
-    x: list[float],
-    z: list[float]
-) -> float:
+def load_scenarios_with_flexible(num_scenarios, T, trace_name, proportion_base=0.5):
     """
-    Computes the objective function value for the OSDM problem.
-
+    Load scenarios from pre-saved traces.
+    
     Args:
-        T (int): The time horizon.
-        p (list): A list of prices p_t for t in [1, T].
-        gamma (float): Switching cost parameter for x.
-        delta (float): Switching cost parameter for z.
-        c_delivery (float): Parameter for the discharge cost function.
-        eps_delivery (float): Parameter for the discharge cost function (eps_delivery < c_delivery).
-        x (list): A list of charge values x_t for t in [1, T].
-        z (list): A list of discharge values z_t for t in [1, T].
+        num_scenarios: Number of scenarios to load or generate
+        T: Time horizon
+        trace_name: Name of the trace to load
+        demand_range: (min_demand, max_demand)
 
     Returns:
-        float: The computed objective function value.
+        price_scenarios, demand_scenarios
     """
-    if not (len(p) == T and len(x) == T and len(z) == T and len(s) == T + 1):
-        raise ValueError("Length of price, x, and z lists must equal T.")
+    price_scenarios = []
+    demand_scenarios = []
 
-    obj_value = 0.0
+    # choose a price signal from the available traces
+    filename = trace_name
+    signal, datetimes, p_min, p_max = load_signal_trace(filename)
 
-    # state of charge variable (starts at 0)
-    s = np.zeros(T + 1)
-    for t in range(1, T + 1):
-        s[t] = max(s[t - 1] + x[t - 1] - z[t - 1], 0)
+    # if we don't already have scenarios pickled for this configuration, generate them
+    # first check for a pickled file in demand_traces
+    pickle_filename = f"demand_traces/{trace_name}_num{num_scenarios}_deadline{T}.pkl"
+    try:
+        with open(pickle_filename, "rb") as f:
+            price_scenarios, demand_scenarios = pickle.load(f)
+        print(f"Loaded {num_scenarios} scenarios from {pickle_filename}.")
+        return price_scenarios, demand_scenarios, p_min, p_max
+    except FileNotFoundError:
+        print(f"No pickled scenarios found at {pickle_filename}, generating new scenarios.")
+        for _ in range(num_scenarios):
+            # randomly choose an index from datetimes, and make sure there are at least T slots including/after that index
+            index = np.random.randint(0, len(datetimes) - T)
+            dtSequence = datetimes[index:index+T]
 
-    # Cost of purchasing energy
-    cost_purchasing = sum(p[t] * z[t] for t in range(T))
-    obj_value += cost_purchasing
+            # Get the signal trace for the sequence
+            p = signal[dtSequence].tolist()
 
-    # Switching costs (L1 norm)
-    switching_cost_x = sum(gamma * abs(x[t] - x[t - 1]) for t in range(1, T))
-    switching_cost_z = sum(delta * abs(z[t] - z[t - 1]) for t in range(1, T))
-    obj_value += (switching_cost_x + switching_cost_z)
+            # randomly choose an available index from the ctx to get demand traces
+            bucket_min, bucket_max = int(ctx["bucket_stats"]["bucket"].min()), int(ctx["bucket_stats"]["bucket"].max())
+            # choose a random start bucket index so that we have at least T buckets available
+            start_bucket = np.random.randint(bucket_min, bucket_max - T)
+            idxs = list(range(start_bucket, start_bucket + T))
 
-    # Discharge costs
-    discharge_cost = sum(c_delivery * z[t] + eps_delivery * z[t] - c_delivery * z[t] * s[t-1] for t in range(T))
-    obj_value += discharge_cost
+            # get the base and flexible demand series for these indexes, scaled down by a factor of 40.0
+            base_scaled, flex_scaled, deltas, details = trace_loader.compute_base_flexible_series(
+                ctx, day_bucket_indexes=idxs, T=T, seed=123, scale_divisor=40.0, proportion_base=proportion_base
+            )
 
-    return obj_value
+            price_scenarios.append(p)
+            demand_scenarios.append(base_scaled)
+
+        return price_scenarios, demand_scenarios, p_min, p_max
+
+def load_scenarios_with_flexible(num_scenarios, T, trace_name, proportion_base=0.5):
+    """
+    Load scenarios with base and flexible demand plus deadlines.
+
+    Returns:
+      price_scenarios, base_scenarios, flex_scenarios, Delta_f_scenarios, p_min, p_max
+    """
+    price_scenarios = []
+    base_scenarios = []
+    flex_scenarios = []
+    Delta_scenarios = []
+
+    signal, datetimes, p_min, p_max = load_signal_trace(trace_name)
+
+    # if we don't already have scenarios pickled for this configuration, generate them
+    # first check for a pickled file in demand_traces
+    pickle_filename = f"demand_traces/{trace_name}_num{num_scenarios}_deadline{T}_prop{proportion_base}.pkl"
+    try:
+        with open(pickle_filename, "rb") as f:
+            price_scenarios, base_scenarios, flex_scenarios, Delta_scenarios = pickle.load(f)
+        print(f"Loaded {num_scenarios} scenarios from {pickle_filename}.")
+        return price_scenarios, base_scenarios, flex_scenarios, Delta_scenarios, p_min, p_max
+
+    except FileNotFoundError:
+        print(f"No pickled scenarios found at {pickle_filename}, generating new scenarios.")
+        while len(price_scenarios) < num_scenarios:
+            # randomly choose an index from datetimes, and make sure there are at least T slots including/after that index
+            index = np.random.randint(0, len(datetimes) - T)
+            dtSequence = datetimes[index:index+T]
+
+            # Get the signal trace for the sequence
+            p = signal[dtSequence].tolist()
+
+            # randomly choose an available index from the ctx to get demand traces
+            bucket_min, bucket_max = int(ctx["bucket_stats"]["bucket"].min()), int(ctx["bucket_stats"]["bucket"].max())
+            # choose a random start bucket index so that we have at least T buckets available
+            start_bucket = np.random.randint(bucket_min, bucket_max - T)
+            idxs = list(range(start_bucket, start_bucket + T))
+
+            # get the base and flexible demand series for these indexes, scaled down by a factor of 40.0
+            base_scaled, flex_scaled, deltas, details = trace_loader.compute_base_flexible_series(
+                ctx, day_bucket_indexes=idxs, T=T, seed=123, scale_divisor=40.0, proportion_base=proportion_base
+            )
+
+            # first make sure that solving for the optimal solution is feasible
+            s_0 = 0.0
+            x_0 = 0.0
+            z_0 = 0.0
+            gamma = 10 # switching cost parameter for x
+            delta = 5 # switching cost parameter for z
+            c_delivery = 0.2 # parameter for the discharge cost function
+            eps_delivery = 0.05 # parameter for the discharge cost function (eps_delivery < c_delivery)
+            S = 1 # maximum capacity of the inventory (everything scaled to unit sizes)
+            try:
+                status, results = opt_sol.optimal_solution(
+                    T, p, gamma, delta, c_delivery, eps_delivery, S, base_scaled, flex_scaled, deltas, s_0, x_0, z_0, solver_timeout=30.0
+                )
+                if status != "Optimal":
+                    print("Generated scenario is not feasible for OPT, skipping this scenario.")
+                    continue
+            except:
+                print("Error occurred while solving for OPT, skipping this scenario.")
+                continue
+
+            price_scenarios.append(p)
+            base_scenarios.append(base_scaled)
+            flex_scenarios.append(flex_scaled)
+            Delta_scenarios.append(deltas)
+
+
+
+        # save the generated scenarios to a pickle file for future use
+        with open(pickle_filename, "wb") as f:
+            pickle.dump((price_scenarios, base_scenarios, flex_scenarios, Delta_scenarios), f)
+        print(f"Saved generated scenarios to {pickle_filename}.")
+
+        return price_scenarios, base_scenarios, flex_scenarios, Delta_scenarios, p_min, p_max
+
