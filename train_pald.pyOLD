@@ -32,9 +32,9 @@ solver_options = { "solve_method": "ECOS", "abstol": 1e-5, "reltol": 1e-5, "feas
 
 parser = argparse.ArgumentParser(description="Train PALD with flexible demand and deadlines.")
 parser.add_argument('--batch_size', type=int, default=25, help='Batch size for training (default: 25)')
+parser.add_argument('--random_restarts', type=int, default=50, help='Number of batches to wait before reinitializing thresholds (default: 100)')
 parser.add_argument('--num_batches', type=int, default=1, help='Number of batches per epoch (default: 1)')
-parser.add_argument('--use_cost_loss', action='store_true', help='Use total cost loss instead of competitive-ratio loss')
-parser.add_argument('--pretraining_loop', type=int, default=100, help='Number of epochs to pretrain with random thresholds (default: 100)')
+parser.add_argument('--use_competitive_loss', action='store_true', help='Use competitive-ratio loss instead of total cost loss')
 args = parser.parse_args()
 
 K = 10           # number of segments in piecewise linear approximation for psi
@@ -45,14 +45,15 @@ T = 48          # 12 hours in 15-minute intervals
 c_delivery = 0.2
 eps_delivery = 0.05
 epochs = 200
+pretraining_loop = 100 # number of random initializations to find best starting y
 # get batch size from command line 
 batch_size = args.batch_size
-# get length of pretraining loop from command line
-pretraining_loop = args.pretraining_loop
+# get number of batches from command line
+restarts = args.random_restarts
 # get number of batches from command line
 num_batches = args.num_batches
-# use total cost loss flag
-use_cost_loss = args.use_cost_loss
+# use competitive loss flag
+use_competitive_loss = args.use_competitive_loss
 trace = "CAISO"
 learning_rate = 1.0
 
@@ -123,6 +124,61 @@ opt_costs_all, total_demands_all = precompute_opt_costs_flex(price_all, base_all
 num_opt_ok = sum(1 for v in (opt_costs_all or []) if (v is not None and v > 1e-6))
 print(f"OPT costs available for {num_opt_ok}/{total_instances} instances.")
 
+# Heuristic initialization of y:
+# Prefer using OPT purchases: set y to constant at (avg price OPT "accepted" + gamma),
+# where accepted means x_opt[t] > 0. If OPT isn't available, fall back to
+# (global average training price + gamma). Always pin the last value to (p_min + 2*gamma).
+
+def compute_opt_accepted_avg_price(opt_costs, total_demands):
+    instance_avg_prices = []
+    for opt_cost, total_demand in zip(opt_costs, total_demands):
+        if opt_cost is not None and total_demand > 1e-6:
+            avg_price = opt_cost / total_demand
+            instance_avg_prices.append(avg_price)
+    if instance_avg_prices:
+        return sum(instance_avg_prices) / len(instance_avg_prices)
+    return None
+
+# Compute OPT-accepted average price if possible
+print("Computing OPT-accepted average price...")
+opt_accepted_avg = compute_opt_accepted_avg_price(opt_costs_all, total_demands_all)
+
+# Fallback global average price across training instances
+if price_all:
+    total_sum = 0.0
+    total_count = 0
+    for seq in price_all:
+        for v in seq:
+            total_sum += float(v)
+            total_count += 1
+    p_avg = total_sum / total_count if total_count > 0 else float(p_max)
+else:
+    p_avg = float(p_max)
+
+y0_val = (opt_accepted_avg + 2.0 * gamma + 2.0*delta) if (opt_accepted_avg is not None) else (p_avg + gamma)
+if opt_accepted_avg is not None:
+    print(f"OPT-accepted average price: {opt_accepted_avg:.4f}")
+last_val = float(p_min) + 2.0 * gamma
+y_init = [y0_val for _ in range(K)]
+y_init_delivery = [y0_val * (c_delivery + eps_delivery) for _ in range(K)]
+
+
+
+# Ensure non-increasing: y[i] >= y[i+1]
+for i in range(1, K):
+    if y_init[i] > y_init[i-1]:
+        y_init[i] = y_init[i-1]
+
+# Set the last value exactly as requested (may break non-increasing at the tail by design)
+if K > 0:
+    y_init[-1] = last_val
+    y_init_delivery[-1] = last_val * (c_delivery + eps_delivery)
+
+y = torch.nn.Parameter(torch.tensor(y_init, dtype=torch.float32))
+y_flex_p = torch.nn.Parameter(torch.tensor(y_init, dtype=torch.float32))  # flexible purchase threshold
+# Delivery threshold can be initialized to same scale
+y_flex_d = torch.nn.Parameter(torch.tensor(y_init_delivery, dtype=torch.float32))
+
 # Keep analytical threshold utilities for plotting comparison
 def base_threshold(w: float, p_min: float, p_max: float, gamma: float, delta: float, c: float, eps: float, T: int, alpha: float, b: float = 1.0) -> float:
     lhs = p_max + 2.0 * gamma + p_min * c
@@ -170,13 +226,28 @@ y = torch.nn.Parameter(torch.tensor(y_init_base, dtype=torch.float32))
 y_flex_p = torch.nn.Parameter(torch.tensor(y_init_flex_p, dtype=torch.float32))  # flexible purchase threshold
 y_flex_d = torch.nn.Parameter(torch.tensor(y_init_flex_d, dtype=torch.float32))  # flexible delivery threshold
 
+# initialize a random threshold 
+# y_random = torch.rand(K) * (float(price_max) - float(price_min)) + float(price_min)
+# y_random, _ = torch.sort(y_random, descending=True)
+# y_random[-1] = float(p_min) + 2.0 * float(gamma)
+
+# y_flex_p_random = torch.rand(K) * (float(price_max) - float(price_min)) + float(price_min)
+# y_flex_p_random, _ = torch.sort(y_flex_p_random, descending=True)
+# y_flex_p_random[-1] = float(p_min) + 2.0 * float(gamma)
+
+# y_flex_d_random = torch.rand(K) * (float(price_max) * (c_delivery + eps_delivery) - float(price_min) * (c_delivery + eps_delivery)) + float(price_min) * (c_delivery + eps_delivery)
+# y_flex_d_random, _ = torch.sort(y_flex_d_random, descending=True)
+# y_flex_d_random[-1] = float(p_min) * (c_delivery + eps_delivery) + 2.0 * float(delta)
+
+# # Create learnable tensors from random init
+# y = torch.nn.Parameter(torch.tensor(y_random, dtype=torch.float32))
+# y_flex_p = torch.nn.Parameter(torch.tensor(y_flex_p_random, dtype=torch.float32))
+# y_flex_d = torch.nn.Parameter(torch.tensor(y_flex_d_random, dtype=torch.float32))
 
 pald_base_layer = make_pald_base_layer(K, gamma)
 pald_flex_purchase_layer = make_pald_flex_purchase_layer(K, gamma)
 pald_flex_delivery_layer = make_pald_flex_delivery_layer(K, delta, c_delivery, eps_delivery)
-# optimizer = optim.Adam([y, y_flex_p, y_flex_d], lr=learning_rate)
-# use SGD instead
-optimizer = optim.SGD([y, y_flex_p, y_flex_d], lr=learning_rate)
+optimizer = optim.Adam([y, y_flex_p, y_flex_d], lr=learning_rate)
 
 # Track the best thresholds seen during training (by total loss)
 best_snapshot = {
@@ -188,10 +259,10 @@ best_snapshot = {
 }
 
 # if a saved model exists, load it
-# if os.path.exists("best_thresholds_{}_{}.pkl".format(trace, batch_size)):
-#     with open("best_thresholds_{}_{}.pkl".format(trace, batch_size), "rb") as f:
-#         best_snapshot = pickle.load(f)
-#         print(f"Loaded saved best thresholds with loss {best_snapshot['loss']:.4f}.")
+if os.path.exists("best_thresholds_{}_{}.pkl".format(trace, batch_size)):
+    with open("best_thresholds_{}_{}.pkl".format(trace, batch_size), "rb") as f:
+        best_snapshot = pickle.load(f)
+        print(f"Loaded saved best thresholds with loss {best_snapshot['loss']:.4f}.")
 
 def compute_segment_caps(w_prev: float, K: int):
     """Remaining capacity per segment given cumulative fraction w_prev."""
@@ -216,19 +287,18 @@ def torch_objective(p_seq, x_seq, z_seq, gamma, delta, c, eps):
     # state of charge s[0..T]
     s = []
     s_prev = torch.tensor(0.0, dtype=torch.float32)
-    s.append(s_prev)
-    for t in range(1, Tn+1):
-        s_t = torch.maximum(s_prev + x_seq[t-1] - z_seq[t-1], torch.tensor(0.0))
+    for t in range(Tn):
+        s_t = torch.maximum(s_prev + x_seq[t] - z_seq[t], torch.tensor(0.0))
         s.append(s_t)
         s_prev = s_t
     s_torch = torch.stack(s)  # s[0..T-1] corresponds to s_1..s_T in numpy version
 
     # Costs
-    cost_purchasing = (p_seq * x_seq).sum()
+    cost_purchasing = (p_seq * z_seq).sum()
     switching_cost_x = gamma * (x_seq[1:] - x_seq[:-1]).abs().sum() if Tn > 1 else torch.tensor(0.0)
     switching_cost_z = delta * (z_seq[1:] - z_seq[:-1]).abs().sum() if Tn > 1 else torch.tensor(0.0)
     # Note: s_{t-1} term via roll(1); s_{-1} uses previous s_T but is unused because multiplied with z[0]; fix first index:
-    s_prev_seq = torch.cat([s_torch[:-1]])
+    s_prev_seq = torch.cat([torch.tensor([0.0]), s_torch[:-1]])
     discharge_cost = (p_seq * (c * z_seq + eps * z_seq - c * s_prev_seq * z_seq)).sum()
     return cost_purchasing + switching_cost_x + switching_cost_z + discharge_cost
 
@@ -265,61 +335,56 @@ reinitialized = 0
 try: 
     for epoch in range(epochs):
         # if we are still in the pretraining loop, we randomly reinitialize y each epoch
-        if epoch < pretraining_loop and epoch > 0:
-            # reinitialize y, y_flex_p, y_flex_d to random values between p_min and p_max
-            with torch.no_grad():
-                price_batch = price_all[start:end]
-                price_seq = price_batch[0]
-                y_random = torch.rand(K) * (float(price_max) - float(price_min)) + float(price_min)
-                y_random, _ = torch.sort(y_random, descending=True)
-                y_random[-1] = float(p_min) + 2.0 * float(gamma)
-                y.copy_(y_random)
-
-                y_flex_p_random = torch.rand(K) * (float(price_max) - float(price_min)) + float(price_min)
-                y_flex_p_random, _ = torch.sort(y_flex_p_random, descending=True)
-                y_flex_p_random[-1] = float(price_min) + 2.0 * float(gamma)
-                y_flex_p.copy_(y_flex_p_random)
-
-                y_flex_d_random = torch.rand(K) * (float(price_max) * (c_delivery + eps_delivery) - float(price_min) * (c_delivery + eps_delivery)) + float(price_min) * (c_delivery + eps_delivery)
-                y_flex_d_random, _ = torch.sort(y_flex_d_random, descending=True)
-                y_flex_d_random[-1] = float(price_min) * (c_delivery + eps_delivery) + 2.0 * float(delta)
-                y_flex_d.copy_(y_flex_d_random)
-
-                # project to ensure robustness
-                y_proj = project_y_robust(y, K, float(p_min), float(p_max), float(gamma), float(delta), float(c_delivery), float(eps_delivery), int(T), beta=beta)
-                if y_proj is not None:
-                    for i in range(K):
-                        y[i] = torch.tensor(float(y_proj[i]))
-                if K > 0:
-                    y[-1] = torch.tensor(float(p_min) + 2.0 * gamma)
-                phi_proj, psi_proj = project_y_flex_robust(
-                    y_flex_p, y_flex_d, K,
-                    float(p_min), float(p_max),
-                    float(gamma), float(delta),
-                    float(c_delivery), float(eps_delivery),
-                    int(T), beta=beta
-                )
-                for i in range(K):
-                    y_flex_p[i] = torch.tensor(float(phi_proj[i]))
-                    y_flex_d[i] = torch.tensor(float(psi_proj[i]))
-                # clamp to max ranges (safety)
-                for i in range(K):
-                    y[i] = torch.clamp(y[i], max=float(p_max))
-                    y_flex_p[i] = torch.clamp(y_flex_p[i], max=float(p_max))
-                    y_flex_d[i] = torch.clamp(y_flex_d[i], max=float(p_max) * (c_delivery + eps_delivery))
-
-            # clear the losses
-            losses = []
-        
-        if epoch == pretraining_loop:
-            print(f"Pretraining completed after {pretraining_loop} epochs")
-            # load the best snapshot so far
-            if best_snapshot["y"] is not None:
+        if epoch < pretraining_loop:
+            # look at the losses in the last restarts epochs, if loss has not improved, reinitialize
+            cur_best_epoch = best_snapshot["epoch"]
+            if epoch - cur_best_epoch > restarts:
+                print(f"Initializing y to random values.")
+                # reinitialize y, y_flex_p, y_flex_d to random values between p_min and p_max
                 with torch.no_grad():
-                    y.copy_(best_snapshot["y"])
-                    y_flex_p.copy_(best_snapshot["yp"])
-                    y_flex_d.copy_(best_snapshot["yd"])
-                print(f"Loaded best snapshot from pretraining with loss {best_snapshot['loss']:.4f} at epoch {best_snapshot['epoch']}.")
+                    price_batch = price_all[start:end]
+                    price_seq = price_batch[0]
+                    y_random = torch.rand(K) * (float(price_max) - float(price_min)) + float(price_min)
+                    y_random, _ = torch.sort(y_random, descending=True)
+                    y_random[-1] = float(p_min) + 2.0 * float(gamma)
+                    y.copy_(y_random)
+
+                    y_flex_p_random = torch.rand(K) * (float(price_max) - float(price_min)) + float(price_min)
+                    y_flex_p_random, _ = torch.sort(y_flex_p_random, descending=True)
+                    y_flex_p_random[-1] = float(price_min) + 2.0 * float(gamma)
+                    y_flex_p.copy_(y_flex_p_random)
+
+                    y_flex_d_random = torch.rand(K) * (float(price_max) * (c_delivery + eps_delivery) - float(price_min) * (c_delivery + eps_delivery)) + float(price_min) * (c_delivery + eps_delivery)
+                    y_flex_d_random, _ = torch.sort(y_flex_d_random, descending=True)
+                    y_flex_d_random[-1] = float(price_min) * (c_delivery + eps_delivery) + 2.0 * float(delta)
+                    y_flex_d.copy_(y_flex_d_random)
+
+                    # project to ensure robustness
+                    y_proj = project_y_robust(y, K, float(p_min), float(p_max), float(gamma), float(delta), float(c_delivery), float(eps_delivery), int(T), beta=beta)
+                    if y_proj is not None:
+                        for i in range(K):
+                            y[i] = torch.tensor(float(y_proj[i]))
+                    if K > 0:
+                        y[-1] = torch.tensor(float(p_min) + 2.0 * gamma)
+                    phi_proj, psi_proj = project_y_flex_robust(
+                        y_flex_p, y_flex_d, K,
+                        float(p_min), float(p_max),
+                        float(gamma), float(delta),
+                        float(c_delivery), float(eps_delivery),
+                        int(T), beta=beta
+                    )
+                    for i in range(K):
+                        y_flex_p[i] = torch.tensor(float(phi_proj[i]))
+                        y_flex_d[i] = torch.tensor(float(psi_proj[i]))
+                    # clamp to max ranges (safety)
+                    for i in range(K):
+                        y[i] = torch.clamp(y[i], max=float(p_max))
+                        y_flex_p[i] = torch.clamp(y_flex_p[i], max=float(p_max))
+                        y_flex_d[i] = torch.clamp(y_flex_d[i], max=float(p_max) * (c_delivery + eps_delivery))
+
+                # clear the losses
+                losses = []
+                reinitialized = epoch
 
         for batch_idx in range(num_batches):
             start = batch_idx * batch_size
@@ -523,7 +588,10 @@ try:
 
                 pald_cost = torch_objective(p_torch, x_torch, z_torch, gamma, delta, c_delivery, eps_delivery)
 
-                if not use_cost_loss:
+                # check that the total delivery of pald is close to the total demand
+                # print("total delivered: ", torch.sum(z_torch).item(), " total demand: ", sum(base_seq) + sum(flex_seq))
+
+                if use_competitive_loss:
                     # # Competitive-ratio loss: ReLU(pald/opt - 1), opt treated as constant
                     inst_loss = torch.tensor(0.0)
                     if opt_costs_all is not None:
@@ -535,19 +603,9 @@ try:
                             denom = torch.tensor(float(opt_val), dtype=torch.float32)
                             inst_loss = torch.relu(((pald_cost / denom) - 1.0)*1000.0)  # scale up to keep similar magnitude
                     batch_total_loss = batch_total_loss + inst_loss
-
-                    # # check that the total delivery of pald is close to the total demand
-                    # print("total delivered: ", torch.sum(z_torch).item(), " total demand: ", sum(base_seq) + sum(flex_seq))
-                    # print(" pald cost: ", pald_cost.item(), " opt cost: ", None if opt_costs_all is None else opt_costs_all[global_idx], " inst loss: ", inst_loss.item())
-
-                    # # check that the torch_objective matches the np_objective_function
-                    # np_cost = np_objective_function(T, [float(v) for v in price_seq], gamma, delta, c_delivery, eps_delivery, [float(v.detach()) for v in x_torch], [float(v.detach()) for v in z_torch])
-                    # print(" np cost: ", np_cost, " pald cost: ", pald_cost.item())
-
                 else:
                     # Total cost loss
                     batch_total_loss = batch_total_loss + pald_cost
-                
 
             # end for each instance
 
@@ -563,35 +621,33 @@ try:
             loss = batch_total_loss + 0.1 * mono_penalty
             losses.append(float(loss.item()))
 
-            # if we are not in the pretraining loop, we do normal optimization
-            if epoch >= pretraining_loop:
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-                # Project y onto robustness sets every 10 epochs
-                with torch.no_grad():
-                    y_proj = project_y_robust(y, K, float(p_min), float(p_max), float(gamma), float(delta), float(c_delivery), float(eps_delivery), int(T), beta=beta)
-                    if y_proj is not None:
-                        for i in range(K):
-                            y[i] = torch.tensor(float(y_proj[i]))
-                    if K > 0:
-                        y[-1] = torch.tensor(float(p_min) + 2.0 * gamma)
-                    phi_proj, psi_proj = project_y_flex_robust(
-                        y_flex_p, y_flex_d, K,
-                        float(p_min), float(p_max),
-                        float(gamma), float(delta),
-                        float(c_delivery), float(eps_delivery),
-                        int(T), beta=beta
-                    )
+            # Project y onto robustness sets every 10 epochs
+            with torch.no_grad():
+                y_proj = project_y_robust(y, K, float(p_min), float(p_max), float(gamma), float(delta), float(c_delivery), float(eps_delivery), int(T), beta=beta)
+                if y_proj is not None:
                     for i in range(K):
-                        y_flex_p[i] = torch.tensor(float(phi_proj[i]))
-                        y_flex_d[i] = torch.tensor(float(psi_proj[i]))
-                    # clamp to max ranges (safety)
-                    for i in range(K):
-                        y[i] = torch.clamp(y[i], max=float(p_max))
-                        y_flex_p[i] = torch.clamp(y_flex_p[i], max=float(p_max))
-                        y_flex_d[i] = torch.clamp(y_flex_d[i], max=float(p_max) * (c_delivery + eps_delivery))
+                        y[i] = torch.tensor(float(y_proj[i]))
+                if K > 0:
+                    y[-1] = torch.tensor(float(p_min) + 2.0 * gamma)
+                phi_proj, psi_proj = project_y_flex_robust(
+                    y_flex_p, y_flex_d, K,
+                    float(p_min), float(p_max),
+                    float(gamma), float(delta),
+                    float(c_delivery), float(eps_delivery),
+                    int(T), beta=beta
+                )
+                for i in range(K):
+                    y_flex_p[i] = torch.tensor(float(phi_proj[i]))
+                    y_flex_d[i] = torch.tensor(float(psi_proj[i]))
+                # clamp to max ranges (safety)
+                for i in range(K):
+                    y[i] = torch.clamp(y[i], max=float(p_max))
+                    y_flex_p[i] = torch.clamp(y_flex_p[i], max=float(p_max))
+                    y_flex_d[i] = torch.clamp(y_flex_d[i], max=float(p_max) * (c_delivery + eps_delivery))
 
             if (batch_idx % 10 == 0) and (epoch % 10 == 0):
                 # Optionally log average CR over this batch (where OPT exists)

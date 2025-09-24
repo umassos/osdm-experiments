@@ -18,7 +18,7 @@ np.set_printoptions(suppress=True,precision=3)
 
 def experiment():
     ############################################# set up OSDM experiment parameters
-    T = 96 # consider a 24-hour time horizon, 15-min price intervals
+    T = 48 # consider a 24-hour time horizon, 15-min price intervals
 
     gamma = 10 # switching cost parameter for x
     delta = 5 # switching cost parameter for z

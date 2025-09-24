@@ -37,20 +37,29 @@ def objective_function(
 
     # state of charge variable (starts at 0)
     s = np.zeros(T + 1)
-    for t in range(1, T + 1):
-        s[t] = max(s[t - 1] + x[t - 1] - z[t - 1], 0)
+
+    # purchasing variable (starts at 0)
+    x_new = np.zeros(T + 1)
+    x_new[1:] = np.array(x)
+
+    # delivery variable (starts at 0)
+    z_new = np.zeros(T + 1)
+    z_new[1:] = np.array(z)
+
+    for t in range(1, T+1):       
+        s[t] = max(s[t - 1] + x_new[t] - z_new[t], 0)
 
     # Cost of purchasing energy
-    cost_purchasing = sum(p[t] * z[t] for t in range(T))
+    cost_purchasing = sum(p[t-1] * x_new[t] for t in range(1, T+1))
     obj_value += cost_purchasing
 
     # Switching costs (L1 norm)
-    switching_cost_x = sum(gamma * abs(x[t] - x[t - 1]) for t in range(1, T))
-    switching_cost_z = sum(delta * abs(z[t] - z[t - 1]) for t in range(1, T))
+    switching_cost_x = sum(gamma * abs(x_new[t] - x_new[t - 1]) for t in range(1, T+1))
+    switching_cost_z = sum(delta * abs(z_new[t] - z_new[t - 1]) for t in range(1, T+1))
     obj_value += (switching_cost_x + switching_cost_z)
 
-    # Discharge costs
-    discharge_cost = sum(p[t] * (c_delivery * z[t] + eps_delivery * z[t] - c_delivery * z[t] * s[t-1]) for t in range(T))
+    # Discharge costs.   # p_1 * (c_delivery * z_1 + eps_delivery * z_1 - c_delivery * z_1 * s_0) + ...   
+    discharge_cost = sum(p[t-1] * (c_delivery * z_new[t] + eps_delivery * z_new[t] - c_delivery * z_new[t] * s[t-1]) for t in range(1, T+1))
     obj_value += discharge_cost
 
     return obj_value
@@ -342,7 +351,7 @@ def paad_algorithm(
     flexible_drivers = set()
 
     # get value of alpha (competitive ratio)
-    alpha = get_alpha(p_min, p_max, c_delivery, eps_delivery, T, gamma, delta) 
+    alpha = get_alpha(p_min, p_max, c_delivery, eps_delivery, 96, gamma, delta) 
     print(f"Computed alpha: {alpha}")
 
     # add base driver with size S to the system at initialization

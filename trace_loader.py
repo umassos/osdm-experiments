@@ -277,6 +277,46 @@ def compute_base_flexible_series(
         base_scaled = [x / scale_divisor for x in base_series]
         flexible_scaled = [x / scale_divisor for x in flexible_series]
 
+
+    # I want roughly 2 out of the T demands to have base > 0 and flexible > 0 to ensure training is tractable.
+    # First sample Unif[1,2,3] random indexes from 0..T-1, weighted by the base demand values.
+    base_array = np.array(base_scaled)
+    base_probs = base_array / np.sum(base_array)
+    # choose a random number of indexes to pick: 1, 2, or 3
+    num_indexes = rng.choice([1, 2, 3])
+    chosen_indexes = rng.choice(int(T), size=num_indexes, replace=False, p=base_probs)
+
+    # select the base demand values at those indexes
+    new_base_scaled = [0.0 for _ in range(int(T))]
+    for i in chosen_indexes:
+        new_base_scaled[i] = base_scaled[i]
+    
+    # rescale new_base_scaled to have the same sum as base_scaled
+    sum_new_base = sum(new_base_scaled)
+    sum_base = sum(base_scaled)
+    if sum_new_base > 0:
+        new_base_scaled = [x * (sum_base / sum_new_base) for x in new_base_scaled]
+    base_scaled = new_base_scaled
+
+    # I want roughly 2 out of the T demands to have base > 0 and flexible > 0 to ensure training is tractable.
+    # First sample Unif[1,2,3] random indexes from 0..T-1, weighted by the flexible demand values.
+    flexible_array = np.array(flexible_scaled)
+    flexible_probs = flexible_array / np.sum(flexible_array)
+    num_indexes = rng.choice([1, 2, 3])
+    chosen_indexes = rng.choice(int(T), size=num_indexes, replace=False, p=flexible_probs)
+
+    # select the flexible demand values at those indexes
+    new_flexible_scaled = [0.0 for _ in range(int(T))]
+    for i in chosen_indexes:
+        new_flexible_scaled[i] = flexible_scaled[i]
+
+    # rescale new_flexible_scaled to have the same sum as flexible_scaled
+    sum_new_flexible = sum(new_flexible_scaled)
+    sum_flexible = sum(flexible_scaled)
+    if sum_new_flexible > 0:
+        new_flexible_scaled = [x * (sum_flexible / sum_new_flexible) for x in new_flexible_scaled]
+    flexible_scaled = new_flexible_scaled
+
     # Compute per-bucket flexible deadlines within the window [0..T-1]
     # Convert hour choices to bucket counts for the current bucket_minutes
     hour_to_buckets = [int(h * 60 // bucket_minutes) for h in flexible_deadline_hours_choices]
