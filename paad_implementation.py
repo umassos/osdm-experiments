@@ -352,7 +352,7 @@ def paad_algorithm(
 
     # get value of alpha (competitive ratio)
     alpha = get_alpha(p_min, p_max, c_delivery, eps_delivery, 96, gamma, delta) 
-    print(f"Computed alpha: {alpha}")
+    # print(f"Computed alpha: {alpha}")
 
     # add base driver with size S to the system at initialization
     new_driver = BaseDriver(id=0, b=S, gamma=gamma, delta=delta, alpha=alpha, p_min=p_min, p_max=p_max, c_delivery=c_delivery, eps_delivery=eps_delivery, T=T)

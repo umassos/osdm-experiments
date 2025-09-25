@@ -35,6 +35,8 @@ parser.add_argument('--batch_size', type=int, default=25, help='Batch size for t
 parser.add_argument('--num_batches', type=int, default=1, help='Number of batches per epoch (default: 1)')
 parser.add_argument('--use_cost_loss', action='store_true', help='Use total cost loss instead of competitive-ratio loss')
 parser.add_argument('--pretraining_loop', type=int, default=100, help='Number of epochs to pretrain with random thresholds (default: 100)')
+parser.add_argument('--trace', type=str, default="CAISO", help='Trace name to use (default: CAISO)')
+parser.add_argument('--month', type=int, default=1, help='Month to filter for in trace (default: 1)')
 args = parser.parse_args()
 
 K = 10           # number of segments in piecewise linear approximation for psi
@@ -53,12 +55,14 @@ pretraining_loop = args.pretraining_loop
 num_batches = args.num_batches
 # use total cost loss flag
 use_cost_loss = args.use_cost_loss
-trace = "CAISO"
+# get trace name from command line
+trace = args.trace
+month = args.month
 learning_rate = 1.0
 
 # Prefetch all scenarios for all batches (e.g., 25 * 100 = 2500)
 total_instances = batch_size * num_batches
-price_all, base_all, flex_all, Delta_all, p_min, p_max = load_scenarios_with_flexible(total_instances, T, trace)
+price_all, base_all, flex_all, Delta_all, p_min, p_max = load_scenarios_with_flexible(total_instances, T, trace, month=month)
 
 # compute the minimum and maximum prices across the actual instances we consider
 all_prices_flat = [price for seq in price_all for price in seq]
@@ -86,10 +90,10 @@ def precompute_opt_costs_flex(price_instances, base_instances, flex_instances, D
         total_demand = sum(b_seq) + sum(f_seq)
         total_demands.append(total_demand)
 
-    if os.path.exists(f"opt_sols/opt_costs_flex_{trace}_{total_instances}.pkl"):
-        with open(f"opt_sols/opt_costs_flex_{trace}_{total_instances}.pkl", "rb") as f:
+    if os.path.exists(f"opt_sols/opt_costs_flex_{trace}_{month}_{total_instances}.pkl"):
+        with open(f"opt_sols/opt_costs_flex_{trace}_{month}_{total_instances}.pkl", "rb") as f:
             opt_costs, total_demands_saved = pickle.load(f)
-        print(f"Loaded precomputed OPT costs for flexible demand from opt_sols/opt_costs_flex_{trace}_{total_instances}.pkl")
+        print(f"Loaded precomputed OPT costs for flexible demand from opt_sols/opt_costs_flex_{trace}_{month}_{total_instances}.pkl")
 
         # verify that the saved total demands match
         if total_demands != total_demands_saved:
@@ -113,7 +117,7 @@ def precompute_opt_costs_flex(price_instances, base_instances, flex_instances, D
     # save the computed OPT costs for future use
     # first ensure the directory exists
     os.makedirs("opt_sols", exist_ok=True)
-    with open(f"opt_sols/opt_costs_flex_{trace}_{total_instances}.pkl", "wb") as f:
+    with open(f"opt_sols/opt_costs_flex_{trace}_{month}_{total_instances}.pkl", "wb") as f:
         pickle.dump((opt_costs, total_demands), f)
     
     return opt_costs, total_demands
@@ -507,6 +511,10 @@ try:
 
                     # Ensure purchases cover deliveries (inventory feasibility)
                     x_t = torch.maximum(x_t, z_t - torch.tensor(storage_state, dtype=torch.float32))
+                    # Ensure we do not exceed max storage capacity
+                    x_t = torch.clamp(x_t, max=torch.tensor(z_t + S - storage_state, dtype=torch.float32))
+                    # Ensure nonnegative
+                    x_t = torch.clamp(x_t, min=torch.tensor(0.0, dtype=torch.float32))
                     storage_state = float(storage_state + float(x_t.detach()) - float(z_t.detach()))
 
                     inst_cost = inst_cost + p_t_t * x_t + gamma * torch.abs(x_t - x_prev_global)
@@ -641,7 +649,7 @@ with torch.no_grad():
         # [CHG] Save tagged best-thresholds file
         os.makedirs(".", exist_ok=True)
         import pickle
-        best_outfile = f"best_thresholds_{trace}_{batch_size}_{run_tag}.pkl"
+        best_outfile = f"best_thresholds_{trace}_{month}_{batch_size}_{run_tag}.pkl"
         with open(best_outfile, 'wb') as f:
             pickle.dump({
                 'y_base': y.detach().cpu().numpy().tolist(),
@@ -916,14 +924,14 @@ def evaluate_and_plot_instance0(prefix: str = 'eval_instance0'):
 
 # Run evaluation before and after training
 # Post-training evaluation
-eval_outfile = evaluate_and_plot_instance0(prefix=f'eval_instance0_{run_tag}')
+eval_outfile = evaluate_and_plot_instance0(prefix=f'eval_instance0_{run_tag}_{trace}_{month}')
 if eval_outfile:
     run_generated_files.append(eval_outfile)
 
 # [ADD] Write a text log for this run
 try:
     os.makedirs("logs", exist_ok=True)
-    log_path = f"logs/train_log_{trace}_{batch_size}_{run_tag}.txt"
+    log_path = f"logs/train_log_{trace}_{month}_{batch_size}_{run_tag}.txt"
     # Parameters to log
     params = {
         "K": K,

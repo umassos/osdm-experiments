@@ -37,6 +37,9 @@ def experiment():
     )
     print(f"Loaded {num_scenarios} scenarios with T={T} from trace {trace_name}.")
 
+    # print the p_min and p_max values
+    print(f"p_min: {p_min}, p_max: {p_max}")
+
     # for now just use the first scenario
     p = price_scenarios[0]
     b = base_scenarios[0]

@@ -13,10 +13,11 @@ carbon_trace_paths = [
 price_trace_paths = [
     "signal_traces/CAISO-LMP-15min-2020-2025.csv",
     "signal_traces/PJM-LMP-15min-2020-2025.csv",
-    "signal_traces/ERCOT-LMP-15min-2020-2025.csv"
+    "signal_traces/ERCOT-LMP-15min-2020-2025.csv",
+    "signal_traces/ISONE-LMP-15min-2020-2025.csv"
 ]
 
-def load_signal_trace(filename):
+def load_signal_trace(filename, month=1):
     """
     Load a signal trace from a CSV file.
 
@@ -58,6 +59,8 @@ def load_signal_trace(filename):
     elif type == 2:  # price
         # filter the df to just consider the final year of data (2024)
         df = df[df.index.year == 2024]
+        # filter the df to just consider the specified month
+        df = df[df.index.month == month]
         # print the df.head
         # print(df.head())
         signal = df["lmp"]

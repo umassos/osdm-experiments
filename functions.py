@@ -60,7 +60,7 @@ def load_scenarios(num_scenarios, T, trace_name, proportion_base=0.5):
 
         return price_scenarios, demand_scenarios, p_min, p_max
 
-def load_scenarios_with_flexible(num_scenarios, T, trace_name, proportion_base=0.5):
+def load_scenarios_with_flexible(num_scenarios, T, trace_name, proportion_base=0.5, month=1):
     """
     Load scenarios with base and flexible demand plus deadlines.
 
@@ -72,11 +72,11 @@ def load_scenarios_with_flexible(num_scenarios, T, trace_name, proportion_base=0
     flex_scenarios = []
     Delta_scenarios = []
 
-    signal, datetimes, p_min, p_max = load_signal_trace(trace_name)
+    signal, datetimes, p_min, p_max = load_signal_trace(trace_name, month=month)
 
     # if we don't already have scenarios pickled for this configuration, generate them
     # first check for a pickled file in demand_traces
-    pickle_filename = f"demand_traces/{trace_name}_num{num_scenarios}_deadline{T}_prop{proportion_base}.pkl"
+    pickle_filename = f"demand_traces/{trace_name}_month{month}_num{num_scenarios}_deadline{T}_prop{proportion_base}.pkl"
     try:
         with open(pickle_filename, "rb") as f:
             price_scenarios, base_scenarios, flex_scenarios, Delta_scenarios = pickle.load(f)
