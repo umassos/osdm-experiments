@@ -31,12 +31,12 @@ run_generated_files: list[str] = []
 solver_options = { "solve_method": "ECOS", "abstol": 1e-5, "reltol": 1e-5, "feastol": 1e-5 }
 
 parser = argparse.ArgumentParser(description="Train PALD with flexible demand and deadlines.")
-parser.add_argument('--batch_size', type=int, default=25, help='Batch size for training (default: 25)')
+parser.add_argument('--batch_size', type=int, default=100, help='Batch size for training (default: 100)')
 parser.add_argument('--num_batches', type=int, default=1, help='Number of batches per epoch (default: 1)')
 parser.add_argument('--use_cost_loss', action='store_true', help='Use total cost loss instead of competitive-ratio loss')
-parser.add_argument('--pretraining_loop', type=int, default=100, help='Number of epochs to pretrain with random thresholds (default: 100)')
-parser.add_argument('--trace', type=str, default="CAISO", help='Trace name to use (default: CAISO)')
-parser.add_argument('--month', type=int, default=1, help='Month to filter for in trace (default: 1)')
+parser.add_argument('--pretraining_loop', type=int, default=200, help='Number of epochs to pretrain with random thresholds (default: 200)')
+parser.add_argument('--trace', type=str, default="ERCOT", help='Trace name to use (default: ERCOT)')
+parser.add_argument('--month', type=int, default=1, help='Month to filter for in trace (default: 1, 99 for all)')
 args = parser.parse_args()
 
 K = 10           # number of segments in piecewise linear approximation for psi
@@ -46,7 +46,7 @@ S = 1.0          # maximum inventory capacity
 T = 48          # 12 hours in 15-minute intervals
 c_delivery = 0.2
 eps_delivery = 0.05
-epochs = 200
+epochs = 500
 # get batch size from command line 
 batch_size = args.batch_size
 # get length of pretraining loop from command line
@@ -58,7 +58,7 @@ use_cost_loss = args.use_cost_loss
 # get trace name from command line
 trace = args.trace
 month = args.month
-learning_rate = 1.0
+learning_rate = 0.1
 
 # Prefetch all scenarios for all batches (e.g., 25 * 100 = 2500)
 total_instances = batch_size * num_batches
@@ -127,6 +127,8 @@ opt_costs_all, total_demands_all = precompute_opt_costs_flex(price_all, base_all
 num_opt_ok = sum(1 for v in (opt_costs_all or []) if (v is not None and v > 1e-6))
 print(f"OPT costs available for {num_opt_ok}/{total_instances} instances.")
 
+exit(0)
+
 # Keep analytical threshold utilities for plotting comparison
 def base_threshold(w: float, p_min: float, p_max: float, gamma: float, delta: float, c: float, eps: float, T: int, alpha: float, b: float = 1.0) -> float:
     lhs = p_max + 2.0 * gamma + p_min * c
@@ -190,12 +192,6 @@ best_snapshot = {
     "yp": None,
     "yd": None,
 }
-
-# if a saved model exists, load it
-# if os.path.exists("best_thresholds_{}_{}.pkl".format(trace, batch_size)):
-#     with open("best_thresholds_{}_{}.pkl".format(trace, batch_size), "rb") as f:
-#         best_snapshot = pickle.load(f)
-#         print(f"Loaded saved best thresholds with loss {best_snapshot['loss']:.4f}.")
 
 def compute_segment_caps(w_prev: float, K: int):
     """Remaining capacity per segment given cumulative fraction w_prev."""
@@ -647,9 +643,9 @@ with torch.no_grad():
         y_flex_d.data = best_snapshot["yd"].to(y_flex_d.device)
 
         # [CHG] Save tagged best-thresholds file
-        os.makedirs(".", exist_ok=True)
+        os.makedirs("best_thresholds", exist_ok=True)
         import pickle
-        best_outfile = f"best_thresholds_{trace}_{month}_{batch_size}_{run_tag}.pkl"
+        best_outfile = f"best_thresholds/best_thresholds_{trace}_{month}_{batch_size}_{run_tag}.pkl"
         with open(best_outfile, 'wb') as f:
             pickle.dump({
                 'y_base': y.detach().cpu().numpy().tolist(),

@@ -14,6 +14,8 @@ import argparse
 import csv
 import statistics
 from typing import List, Dict, Any
+import pickle
+import os
 
 try:
     import opt_sol  # offline optimal via Gurobi
@@ -25,7 +27,7 @@ except Exception:
 # -------------------------
 # Config
 # -------------------------
-T = 96
+T = 48
 S = 1.0
 K = 10
 gamma = 10.0
@@ -40,7 +42,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate PALD-Fast and PAAD over many instances.")
     parser.add_argument("--num_instances", type=int, default=100, help="Number of instances to evaluate (default: 1)")
     parser.add_argument("--trace", type=str, default="CAISO", help="Trace name (default from file config)")
-    parser.add_argument("--month", type=int, default=1, help="Optional month filter")
+    parser.add_argument("--thres_file", type=str, default="best_thresholds.pkl", help="File with learned thresholds (pickle)")
+    parser.add_argument("--analytical", action="store_true", help="Use analytical thresholds instead of learned")
     return parser.parse_args()
 
 # -------------------------
@@ -340,7 +343,7 @@ def summarize(values: List[float]) -> Dict[str, float]:
         "max": vs[-1],
     }
 
-def evaluate_many(price_all, base_all, flex_all, Delta_all, p_min, p_max, y_base, y_flex_p, y_flex_d):
+def evaluate_many(price_all, base_all, flex_all, Delta_all, p_min, p_max, y_base, y_flex_p, y_flex_d, args, month=None):
     num_instances = len(price_all)
     print(f"Evaluating {num_instances} instances...")
 
@@ -354,6 +357,16 @@ def evaluate_many(price_all, base_all, flex_all, Delta_all, p_min, p_max, y_base
     opt_delivered = []
 
     rows: List[Dict[str, Any]] = []
+
+    opt_recompute = True
+
+    # check if optimal solutions are saved
+    total_instances = args.num_instances
+    if os.path.exists(f"opt_sols/opt_costs_flex_{args.trace}_{month}_{args.num_instances}.pkl"):
+        with open(f"opt_sols/opt_costs_flex_{args.trace}_{month}_{args.num_instances}.pkl", "rb") as f:
+            opt_costs, total_demands_saved = pickle.load(f)
+        print(f"Loaded precomputed OPT costs for flexible demand from opt_sols/opt_costs_flex_{args.trace}_{month}_{args.num_instances}.pkl") 
+        opt_recompute = False
 
     for idx in range(num_instances):
         p_seq = price_all[idx]
@@ -390,14 +403,14 @@ def evaluate_many(price_all, base_all, flex_all, Delta_all, p_min, p_max, y_base
         }
 
         # OPT (optional)
-        if _HAS_GUROBI and opt_sol is not None:
+        if opt_recompute:
             try:
                 status, results = opt_sol.optimal_solution(
                     T, p_seq, gamma, delta, c_delivery, eps_delivery, S, b_seq, f_seq, D_seq
                 )
                 if status == "Optimal" and results is not None:
                     oc = np_objective_function(T, p_seq, gamma, delta, c_delivery, eps_delivery,
-                                               results["x"], results["z"])
+                                                results["x"], results["z"])
                     opt_costs.append(oc)
                     delivered_opt = float(sum(results["z"]))
                     opt_delivered.append(delivered_opt)
@@ -409,25 +422,17 @@ def evaluate_many(price_all, base_all, flex_all, Delta_all, p_min, p_max, y_base
                     row["opt_cost"] = None
             except Exception as e:
                 row["opt_cost"] = None
+        else:
+            if idx < len(opt_costs):
+                oc = opt_costs[idx]
+                row["opt_cost"] = oc
+                delivered_opt = total_demands_saved[idx]  # assuming total demand is delivered in optimal
+                row["opt_delivered"] = delivered_opt
+                row["pald_over_opt"] = pald_cost / oc if oc > 0 else None
+                row["paad_over_opt"] = paad_cost / oc if oc > 0 else None
+            else:
+                row["opt_cost"] = None
         rows.append(row)
-
-    # Aggregates
-    print("\n=== Aggregate Results ===")
-    def print_summary(label, vals):
-        if not vals:
-            print(f"{label}: (none)")
-            return
-        s = summarize(vals)
-        print(f"{label}:    mean={s['mean']:.4f}    median={s['median']:.4f}    p95={s['p95']:.4f}    min={s['min']:.4f}")
-
-    # print_summary("PALD-Fast cost", pald_costs)
-    # print_summary("PAAD cost", paad_costs)
-    if opt_costs:
-        # print_summary("OPT cost", opt_costs)
-        ratios_pald = [r["pald_over_opt"] for r in rows if r.get("pald_over_opt")]
-        ratios_paad = [r["paad_over_opt"] for r in rows if r.get("paad_over_opt")]
-        print_summary("PALD/OPT", ratios_pald)
-        print_summary("PAAD/OPT", ratios_paad)
 
     # print_summary("Delivered PALD-Fast", pald_delivered)
     # print_summary("Delivered PAAD", paad_delivered)
@@ -438,38 +443,129 @@ def evaluate_many(price_all, base_all, flex_all, Delta_all, p_min, p_max, y_base
 
 def main():
     args = parse_args()
+    
+    max_month = 3
 
-    print(f"Evaluating {args.num_instances} instances (trace={args.trace}, month={args.month})...")
-    price_all, base_all, flex_all, Delta_all, p_min, p_max = load_scenarios_with_flexible(
-        args.num_instances, T, args.trace, month=args.month
-    )
+    print(f"Evaluating {args.num_instances} instances (trace={args.trace})...")
+    month_data = []
+    threshold_data = []
+    for month in range(1, max_month + 1):
+        price_all, base_all, flex_all, Delta_all, p_min, p_max = load_scenarios_with_flexible(
+            args.num_instances, T, args.trace, month=month
+        )
+        month_data.append((price_all, base_all, flex_all, Delta_all, p_min, p_max))
+    
+        if args.analytical:
+            print("Using analytical thresholds.")
+            # Thresholds (analytical) – same for all instances
+            alpha = float(get_alpha(float(p_min), float(p_max), c_delivery, eps_delivery, T, gamma, delta))
+            w_grid = [(i + 0.5) / K for i in range(K)]
 
-    # Thresholds (analytical) – same for all instances
-    alpha = float(get_alpha(float(p_min), float(p_max), c_delivery, eps_delivery, T, gamma, delta))
-    w_grid = [(i + 0.5) / K for i in range(K)]
+            y_base = [base_threshold(w, float(p_min), float(p_max), gamma, delta,
+                                    c_delivery, eps_delivery, T, alpha, b=1.0) for w in w_grid]
+            for i in range(1, K):
+                y_base[i] = min(y_base[i], y_base[i-1])
+            if K > 0:
+                y_base[-1] = float(p_min) + 2.0 * gamma
 
-    y_base = [base_threshold(w, float(p_min), float(p_max), gamma, delta,
-                             c_delivery, eps_delivery, T, alpha, b=1.0) for w in w_grid]
-    for i in range(1, K):
-        y_base[i] = min(y_base[i], y_base[i-1])
-    if K > 0:
-        y_base[-1] = float(p_min) + 2.0 * gamma
+            y_flex_p = [flex_purchase_threshold(w, float(p_min), float(p_max), gamma, delta,
+                                                c_delivery, eps_delivery, T, alpha, f=1.0) for w in w_grid]
+            for i in range(1, K):
+                y_flex_p[i] = min(y_flex_p[i], y_flex_p[i-1])
+            if K > 0:
+                y_flex_p[-1] = float(p_min) + 2.0 * gamma
 
-    y_flex_p = [flex_purchase_threshold(w, float(p_min), float(p_max), gamma, delta,
-                                        c_delivery, eps_delivery, T, alpha, f=1.0) for w in w_grid]
-    for i in range(1, K):
-        y_flex_p[i] = min(y_flex_p[i], y_flex_p[i-1])
-    if K > 0:
-        y_flex_p[-1] = float(p_min) + 2.0 * gamma
+            y_flex_d = [flex_delivery_threshold(v, float(p_min), float(p_max), gamma, delta,
+                                                c_delivery, eps_delivery, T, alpha, f=1.0) for v in w_grid]
+            for i in range(1, K):
+                y_flex_d[i] = min(y_flex_d[i], y_flex_d[i-1])
+            if K > 0:
+                y_flex_d[-1] = float(p_min) * (c_delivery + eps_delivery) + 2.0 * delta
+            
+            threshold_data.append((y_base, y_flex_p, y_flex_d))
+        else:
+            print("Using learned thresholds.")
+            prefix = args.thres_file
+            # check if file exists
+            try:
+                # look for file named like best_thresholds_{trace}_{month}_{num_instances}_{timestamp}.pkl
+                candidate = f"best_thresholds_{args.trace}_{month}_{args.num_instances}"
+                # check if any file matches
+                import glob
+                files = glob.glob(f"best_thresholds/{candidate}*")
+                if not files:
+                    print(f"No threshold file matching {candidate} found.")
+                    return
+                # take the first match
+                filename = files[0]
+                print(f"Loading thresholds from {filename}...")
+                with open(filename, "rb") as f:
+                    best_snapshot = pickle.load(f)
+                    y_base = best_snapshot["y_base"]
+                    y_flex_p = best_snapshot["y_flex_purchase"]
+                    y_flex_d = best_snapshot["y_flex_delivery"]
+                    if not (len(y_base) == K and len(y_flex_p) == K and len(y_flex_d) == K):
+                        print(f"Threshold lists in {filename} do not match K={K}.")
+                        return
+                    
+                threshold_data.append((y_base, y_flex_p, y_flex_d))
+            except FileNotFoundError:
+                print(f"Threshold file {filename} not found.")
+                return
 
-    y_flex_d = [flex_delivery_threshold(v, float(p_min), float(p_max), gamma, delta,
-                                        c_delivery, eps_delivery, T, alpha, f=1.0) for v in w_grid]
-    for i in range(1, K):
-        y_flex_d[i] = min(y_flex_d[i], y_flex_d[i-1])
-    if K > 0:
-        y_flex_d[-1] = float(p_min) * (c_delivery + eps_delivery) + 2.0 * delta
+    rows = []
+    for month in range(1, max_month + 1):
+        print(f"\n--- Evaluating for Month {month} ---")
+        # get thresholds for this month
+        y_base, y_flex_p, y_flex_d = threshold_data[month - 1]
+        price_all, base_all, flex_all, Delta_all, p_min, p_max = month_data[month - 1]
+        rows_month = evaluate_many(price_all, base_all, flex_all, Delta_all, p_min, p_max, y_base, y_flex_p, y_flex_d, args, month=month)
+        rows.extend(rows_month)
+    
+    # Aggregates
+    print("\n=== Aggregate Results ===")
+    def print_summary(label, vals):
+        if not vals:
+            print(f"{label}: (none)")
+            return
+        s = summarize(vals)
+        print(f"{label}:    mean={s['mean']:.4f}    median={s['median']:.4f}    p95={s['p95']:.4f}    min={s['min']:.4f}")
 
-    evaluate_many(price_all, base_all, flex_all, Delta_all, p_min, p_max, y_base, y_flex_p, y_flex_d)
+    ratios_pald = [r["pald_over_opt"] for r in rows if r.get("pald_over_opt")]
+    ratios_paad = [r["paad_over_opt"] for r in rows if r.get("paad_over_opt")]
+    # truncate ratios to 1.0
+    ratios_pald = [max(1.0, r) for r in ratios_pald]
+    ratios_paad = [max(1.0, r) for r in ratios_paad]
+    print_summary("PALD/OPT", ratios_pald)
+    print_summary("PAAD/OPT", ratios_paad)
+
+    # plot CDF of the ratios
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        def plot_cdf(data, label, color):
+            sorted_data = np.sort(data)
+            yvals = np.arange(1, len(sorted_data) + 1) / float(len(sorted_data))
+            plt.plot(sorted_data, yvals, label=label, color=color)
+
+        plt.figure(figsize=(4, 3), dpi=300)
+        if ratios_pald:
+            plot_cdf(ratios_pald, 'PALD', 'blue')
+        if ratios_paad:
+            plot_cdf(ratios_paad, 'PAAD', 'orange')
+        plt.xlabel('Comp. Ratio')
+        plt.ylabel('Cumulative Probability')
+        # legend at the bottom in two columns
+        plt.legend()
+        plt.grid(True)
+        plt.xlim(1, 4)
+        plt.ylim(0, 1)
+        plt.savefig('comp_ratio_cdf.png')
+        plt.close()
+        print("Saved CDF plot to comp_ratio_cdf.png")
+    except ImportError:
+        print("matplotlib not installed, skipping CDF plot.")
 
 if __name__ == "__main__":
     main()

@@ -59,8 +59,9 @@ def load_signal_trace(filename, month=1):
     elif type == 2:  # price
         # filter the df to just consider the final year of data (2024)
         df = df[df.index.year == 2024]
-        # filter the df to just consider the specified month
-        df = df[df.index.month == month]
+        if month != 99:
+            # filter the df to just consider the specified month
+            df = df[df.index.month == month]
         # print the df.head
         # print(df.head())
         signal = df["lmp"]
@@ -74,7 +75,7 @@ def load_signal_trace(filename, month=1):
     # get the 99th percentile of the signal to avoid outliers
     p_99 = signal.quantile(0.99).copy()
     # cap the signal at the 99th percentile
-    signal[signal > p_99] = p_99
+    signal.loc[signal > p_99] = p_99
     p_max = signal.max()
 
     # extract the sequence of datetime indexes
