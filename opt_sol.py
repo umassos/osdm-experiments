@@ -85,6 +85,14 @@ def optimal_solution(
     model.addConstrs(
         (z[t] <= b_map[t] + f_cumulative[t] for t in time_steps), name="z_upper_bound"
     )
+
+    # Bounds on x_t, the cumulative x_t up to time t is allowed to be at most S + cumulative f_t + cumulative b_t up to t
+    model.addConstrs(
+        (gp.quicksum(x[tau] for tau in range(1, t + 1)) <= S + gp.quicksum(f_map[tau] for tau in range(1, t + 1)) + gp.quicksum(b_map[tau] for tau in range(1, t + 1))
+         for t in time_steps),
+        name="x_cumulative_upper_bound"
+    )
+
     # one additional lower bound on z_t -- the cumulative sum of z_t up to time t should be at least
     # the cumulative sum of all b_t (satisfied by z_lower_bound constraint) plus all f_t where Delta_f_t <= t
     model.addConstrs(

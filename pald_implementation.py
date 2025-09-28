@@ -5,7 +5,7 @@ from cvxpylayers.torch import CvxpyLayer
 PALD CVXPyLayers with integral-aware (per-segment) allocation.
 """
 
-def make_pald_base_layer(K, gamma):
+def make_pald_base_layer(K, gamma, ridge=True):
     x_parts = cp.Variable(K, nonneg=True)
     x_total = cp.Variable(nonneg=True)
 
@@ -21,7 +21,10 @@ def make_pald_base_layer(K, gamma):
         x_total == cp.sum(x_parts),
         x_total <= 1 - w_prev,
     ]
-    ridge = 1e-8 * cp.sum_squares(x_parts) + 1e-8 * cp.sum_squares(x_total)
+    ridge = 0
+    if ridge:
+        # Increase ridge to encourage interior solutions and smoother differentiability
+        ridge = 1e-4 * cp.sum_squares(x_parts) + 1e-4 * cp.sum_squares(x_total)
     hit_cost = p_t * x_total
     switch_cost = gamma * cp.abs(x_total - x_prev) + gamma * cp.abs(x_total)
     phi_cost = y_vec @ x_parts
@@ -31,7 +34,7 @@ def make_pald_base_layer(K, gamma):
                       parameters=[x_prev, w_prev, p_t, y_vec, caps],
                       variables=[x_total])
 
-def make_pald_flex_purchase_layer(K, gamma):
+def make_pald_flex_purchase_layer(K, gamma, ridge=True):
     x_parts = cp.Variable(K, nonneg=True)
     x_total = cp.Variable(nonneg=True)
 
@@ -47,7 +50,10 @@ def make_pald_flex_purchase_layer(K, gamma):
         x_total == cp.sum(x_parts),
         x_total <= 1 - w_prev,
     ]
-    ridge = 1e-8 * cp.sum_squares(x_parts) + 1e-8 * cp.sum_squares(x_total)
+    ridge = 0
+    if ridge:
+        # Increase ridge to encourage interior solutions and smoother differentiability
+        ridge = 1e-4 * cp.sum_squares(x_parts) + 1e-4 * cp.sum_squares(x_total)
     hit_cost = p_t * x_total
     switch_cost = gamma * cp.abs(x_total - x_prev) + gamma * cp.abs(x_total)
     phi_cost = y_vec @ x_parts
@@ -57,7 +63,7 @@ def make_pald_flex_purchase_layer(K, gamma):
                       parameters=[x_prev, w_prev, p_t, y_vec, caps],
                       variables=[x_total])
 
-def make_pald_flex_delivery_layer(K, delta, c_delivery, eps_delivery):
+def make_pald_flex_delivery_layer(K, delta, c_delivery, eps_delivery, ridge=True):
     """
     coeff = p_t * (c_delivery + eps_delivery) - p_t * c_delivery * s_prev
     """
@@ -76,7 +82,10 @@ def make_pald_flex_delivery_layer(K, delta, c_delivery, eps_delivery):
         z_total == cp.sum(z_parts),
         z_total <= 1 - v_prev,
     ]
-    ridge = 1e-8 * cp.sum_squares(z_parts) + 1e-8 * cp.sum_squares(z_total)
+    ridge = 0
+    if ridge:
+        # Increase ridge to encourage interior solutions and smoother differentiability
+        ridge = 1e-4 * cp.sum_squares(z_parts) + 1e-4 * cp.sum_squares(z_total)
     hit_cost = coeff * z_total
     switch_cost = delta * cp.abs(z_total - z_prev) + delta * cp.abs(z_total)
     phi_cost = y_vec @ z_parts
@@ -85,3 +94,19 @@ def make_pald_flex_delivery_layer(K, delta, c_delivery, eps_delivery):
     return CvxpyLayer(prob,
                       parameters=[z_prev, v_prev, coeff, y_vec, caps],
                       variables=[z_total])
+
+
+# helper to compute a (coarse approximation) of the integral over the (piecewise-affine) threshold function phi
+def compute_segment_caps(w_prev: float, K: int):
+    """Remaining capacity per segment given cumulative fraction w_prev."""
+    # Clamp w into [0, 1]
+    w = max(0.0, min(1.0, float(w_prev)))
+    if 1.0 - w <= 1e-9:
+        return [0.0] * K
+    caps = []
+    for i in range(K):
+        left = i / K
+        right = (i + 1) / K
+        cap = max(0.0, right - max(left, w))
+        caps.append(cap)
+    return caps
