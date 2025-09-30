@@ -1,112 +1,173 @@
 import cvxpy as cp
+import numpy as np
 from cvxpylayers.torch import CvxpyLayer
 
 """
 PALD CVXPyLayers with integral-aware (per-segment) allocation.
 """
 
-def make_pald_base_layer(K, gamma, ridge=True):
-    x_parts = cp.Variable(K, nonneg=True)
-    x_total = cp.Variable(nonneg=True)
+def make_pald_base_layer(K):
+    # ---- compile-time constants ----
+    taus_full = np.array([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0], dtype=float)
+    taus = taus_full[:-1]            # locations of hinge knots (exclude last)
+    tau0, tauK = float(taus_full[0]), float(taus_full[-1])
 
-    x_prev = cp.Parameter(nonneg=True)
-    w_prev = cp.Parameter(nonneg=True)
-    p_t = cp.Parameter()
-    y_vec = cp.Parameter((K,))
-    caps = cp.Parameter((K,), nonneg=True)
+    # ---- decision ----
+    x = cp.Variable()
 
-    constraints = [
-        x_parts >= 0,
-        x_parts <= caps,
-        x_total == cp.sum(x_parts),
-        x_total <= 1 - w_prev,
-    ]
-    ridge = 0
-    if ridge:
-        # Increase ridge to encourage interior solutions and smoother differentiability
-        ridge = 1e-4 * cp.sum_squares(x_parts) + 1e-4 * cp.sum_squares(x_total)
-    hit_cost = p_t * x_total
-    switch_cost = gamma * cp.abs(x_total - x_prev) + gamma * cp.abs(x_total)
-    phi_cost = y_vec @ x_parts
-    obj = cp.Minimize(hit_cost + switch_cost - phi_cost + ridge)
-    prob = cp.Problem(obj, constraints)
-    return CvxpyLayer(prob,
-                      parameters=[x_prev, w_prev, p_t, y_vec, caps],
-                      variables=[x_total])
+    # ---- parameters (layer inputs) ----
+    x_prev  = cp.Parameter(1,nonneg=True)                 # scalar
+    w_const = cp.Parameter(1,nonneg=True)                 # scalar
+    p_t     = cp.Parameter(1,nonneg=True)                 # scalar
+    gamma   = cp.Parameter(1,nonneg=True)                 # scalar
+    # IMPORTANT: pass these precomputed from y (outside the graph)
+    w_hinge = cp.Parameter(K, nonneg=True)   # hinge weights >= 0
+    c1      = cp.Parameter()                 # slope term for F (e.g., -y[0])
 
-def make_pald_flex_purchase_layer(K, gamma, ridge=True):
-    x_parts = cp.Variable(K, nonneg=True)
-    x_total = cp.Variable(nonneg=True)
-
-    x_prev = cp.Parameter(nonneg=True)
-    w_prev = cp.Parameter(nonneg=True)
-    p_t = cp.Parameter()
-    y_vec = cp.Parameter((K,))
-    caps = cp.Parameter((K,), nonneg=True)
+    # ---- auxiliaries (nonlinearities live here, no parameters inside atoms) ----
+    z = w_const + x
+    q = cp.Variable(K)                       # >= (z - tau_j)_+
+    r = cp.Variable(K)                       # >= 0.5 * q_j^2
+    u1 = cp.Variable()                       # >= |x - x_prev|
+    u2 = cp.Variable()                       # >= |x|
 
     constraints = [
-        x_parts >= 0,
-        x_parts <= caps,
-        x_total == cp.sum(x_parts),
-        x_total <= 1 - w_prev,
-    ]
-    ridge = 0
-    if ridge:
-        # Increase ridge to encourage interior solutions and smoother differentiability
-        ridge = 1e-4 * cp.sum_squares(x_parts) + 1e-4 * cp.sum_squares(x_total)
-    hit_cost = p_t * x_total
-    switch_cost = gamma * cp.abs(x_total - x_prev) + gamma * cp.abs(x_total)
-    phi_cost = y_vec @ x_parts
-    obj = cp.Minimize(hit_cost + switch_cost - phi_cost + ridge)
-    prob = cp.Problem(obj, constraints)
-    return CvxpyLayer(prob,
-                      parameters=[x_prev, w_prev, p_t, y_vec, caps],
-                      variables=[x_total])
+        z >= tau0, z <= tauK,
+        x >= 0.0, x <= (tauK - w_const),
 
-def make_pald_flex_delivery_layer(K, delta, c_delivery, eps_delivery, ridge=True):
+        q >= z - taus,
+        q >= 0,
+
+        cp.square(q) <= 2 * r,   # convex ≤ affine (DPP-safe)
+        r >= 0,
+
+        u1 >=  x - x_prev,  u1 >= -(x - x_prev),
+        u2 >=  x,           u2 >= -x,
+    ]
+
+    # IMPORTANT: no param*param products in the objective
+    # Use c1 * x (not c1 * z); the dropped c1*w_const is a parameter-only constant → irrelevant to argmin
+    Fz = c1 * x + w_hinge @ r
+
+    objective = cp.Minimize(p_t * x + gamma * (u1 + u2) + Fz)
+    prob = cp.Problem(objective, constraints)
+
+    layer = CvxpyLayer(
+        prob,
+        parameters=[x_prev, w_const, p_t, gamma, w_hinge, c1],
+        variables=[x],
+    )
+
+    return layer
+
+def make_pald_flex_purchase_layer(K):
+    # ---- compile-time constants ----
+    taus_full = np.array([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0], dtype=float)
+    taus = taus_full[:-1]            # locations of hinge knots (exclude last)
+    tau0, tauK = float(taus_full[0]), float(taus_full[-1])
+
+    # ---- decision ----
+    x = cp.Variable()
+
+    # ---- parameters (layer inputs) ----
+    x_prev  = cp.Parameter(1,nonneg=True)                 # scalar
+    w_const = cp.Parameter(1,nonneg=True)                 # scalar
+    p_t     = cp.Parameter(1,nonneg=True)                 # scalar
+    gamma   = cp.Parameter(1,nonneg=True)                 # scalar
+    # IMPORTANT: pass these precomputed from y (outside the graph)
+    w_hinge = cp.Parameter(K, nonneg=True)   # hinge weights >= 0
+    c1      = cp.Parameter()                 # slope term for F (e.g., -y[0])
+
+    # ---- auxiliaries (nonlinearities live here, no parameters inside atoms) ----
+    z = w_const + x
+    q = cp.Variable(K)                       # >= (z - tau_j)_+
+    r = cp.Variable(K)                       # >= 0.5 * q_j^2
+    u1 = cp.Variable()                       # >= |x - x_prev|
+    u2 = cp.Variable()                       # >= |x|
+
+    constraints = [
+        z >= tau0, z <= tauK,
+        x >= 0.0, x <= (tauK - w_const),
+
+        q >= z - taus,
+        q >= 0,
+
+        cp.square(q) <= 2 * r,   # convex ≤ affine (DPP-safe)
+        r >= 0,
+
+        u1 >=  x - x_prev,  u1 >= -(x - x_prev),
+        u2 >=  x,           u2 >= -x,
+    ]
+
+    # IMPORTANT: no param*param products in the objective
+    # Use c1 * x (not c1 * z); the dropped c1*w_const is a parameter-only constant → irrelevant to argmin
+    Fz = c1 * x + w_hinge @ r
+
+    objective = cp.Minimize(p_t * x + gamma * (u1 + u2) + Fz)
+    prob = cp.Problem(objective, constraints)
+
+    layer = CvxpyLayer(
+        prob,
+        parameters=[x_prev, w_const, p_t, gamma, w_hinge, c1],
+        variables=[x],
+    )
+
+    return layer
+
+
+def make_pald_flex_delivery_layer(K):
     """
     coeff = p_t * (c_delivery + eps_delivery) - p_t * c_delivery * s_prev
     """
-    z_parts = cp.Variable(K, nonneg=True)
-    z_total = cp.Variable(nonneg=True)
+    # ---- compile-time constants ----
+    taus_full = np.array([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0], dtype=float)
+    taus = taus_full[:-1]            # locations of hinge knots (exclude last)
+    tau0, tauK = float(taus_full[0]), float(taus_full[-1])
 
-    z_prev = cp.Parameter(nonneg=True)
-    v_prev = cp.Parameter(nonneg=True)
-    coeff = cp.Parameter()
-    y_vec = cp.Parameter((K,))
-    caps = cp.Parameter((K,), nonneg=True)
+    # ---- decision ----
+    x = cp.Variable()
+
+    # ---- parameters (layer inputs) ----
+    x_prev  = cp.Parameter(1,nonneg=True)                 # scalar
+    w_const = cp.Parameter(1,nonneg=True)                 # scalar
+    coeff     = cp.Parameter(1,nonneg=True)                 # delivery cost coefficienct * p_t
+    delta   = cp.Parameter(1,nonneg=True)                 # scalar
+    # IMPORTANT: pass these precomputed from y (outside the graph)
+    w_hinge = cp.Parameter(K, nonneg=True)   # hinge weights >= 0
+    c1      = cp.Parameter()                 # slope term for F (e.g., -y[0])
+
+    # ---- auxiliaries (nonlinearities live here, no parameters inside atoms) ----
+    z = w_const + x
+    q = cp.Variable(K)                       # >= (z - tau_j)_+
+    r = cp.Variable(K)                       # >= 0.5 * q_j^2
+    u1 = cp.Variable()                       # >= |x - x_prev|
+    u2 = cp.Variable()                       # >= |x|
 
     constraints = [
-        z_parts >= 0,
-        z_parts <= caps,
-        z_total == cp.sum(z_parts),
-        z_total <= 1 - v_prev,
+        z >= tau0, z <= tauK,
+        x >= 0.0, x <= (tauK - w_const),
+
+        q >= z - taus,
+        q >= 0,
+
+        cp.square(q) <= 2 * r,   # convex ≤ affine (DPP-safe)
+        r >= 0,
+
+        u1 >=  x - x_prev,  u1 >= -(x - x_prev),
+        u2 >=  x,           u2 >= -x,
     ]
-    ridge = 0
-    if ridge:
-        # Increase ridge to encourage interior solutions and smoother differentiability
-        ridge = 1e-4 * cp.sum_squares(z_parts) + 1e-4 * cp.sum_squares(z_total)
-    hit_cost = coeff * z_total
-    switch_cost = delta * cp.abs(z_total - z_prev) + delta * cp.abs(z_total)
-    phi_cost = y_vec @ z_parts
-    obj = cp.Minimize(hit_cost + switch_cost - phi_cost + ridge)
-    prob = cp.Problem(obj, constraints)
-    return CvxpyLayer(prob,
-                      parameters=[z_prev, v_prev, coeff, y_vec, caps],
-                      variables=[z_total])
 
+    # IMPORTANT: no param*param products in the objective
+    # Use c1 * x (not c1 * z); the dropped c1*w_const is a parameter-only constant → irrelevant to argmin
+    Fz = c1 * x + w_hinge @ r
 
-# helper to compute a (coarse approximation) of the integral over the (piecewise-affine) threshold function phi
-def compute_segment_caps(w_prev: float, K: int):
-    """Remaining capacity per segment given cumulative fraction w_prev."""
-    # Clamp w into [0, 1]
-    w = max(0.0, min(1.0, float(w_prev)))
-    if 1.0 - w <= 1e-9:
-        return [0.0] * K
-    caps = []
-    for i in range(K):
-        left = i / K
-        right = (i + 1) / K
-        cap = max(0.0, right - max(left, w))
-        caps.append(cap)
-    return caps
+    objective = cp.Minimize(coeff * x + delta * (u1 + u2) + Fz)
+    prob = cp.Problem(objective, constraints)
+
+    layer = CvxpyLayer(
+        prob,
+        parameters=[x_prev, w_const, coeff, delta, w_hinge, c1],
+        variables=[x],
+    )
+
+    return layer
