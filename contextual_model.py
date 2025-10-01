@@ -5,16 +5,22 @@ import torch.nn.functional as F
 
 class MonotoneHead(nn.Module):
     """
-    Produces a length-K non-increasing vector y in [low, high] with a softplus-based
-    cumulative form that avoids gate saturation.
+        Produces a length-K non-increasing, concave vector y in [low, high] with a
+        softplus-based construction that avoids gate saturation.
 
     Construction:
-    - Given logits l in R^K, compute positive increments d = softplus(l) + eps.
-    - Form previous-cumulative c_prev[i] = sum_{j < i} d_j.
-    - Normalize c = c_prev / sum_{j < K} d_j so c in [0,1] with c[0] = 0 and c[K-1] = 1.
+        - Parameterize first-difference magnitudes a_i (i=0..K-2) as a non-decreasing sequence:
+                e = softplus(l[:K-1]) + eps,  a_unnorm = cumsum(e)
+            so a_unnorm is non-decreasing.
+        - Normalize w = a_unnorm / sum(a_unnorm) to distribute total drop (top-low) across steps.
+        - Cumulative fractions C = [0, cumsum(w)], length K, so C[0]=0, C[K-1]=1.
     - A top parameter g_top in R sets the starting level via a temperature-scaled sigmoid:
         top = low + (high - low) * sigmoid(g_top / temp).
-    - Define y_i = top - (top - low) * c[i]. Then y_0 = top and y_{K-1} = low.
+        - Define y_i = top - (top - low) * C[i]. Then y_0 = top and y_{K-1} = low.
+
+        Properties:
+        - y is non-increasing and concave (second differences ≤ 0). Linear is a special case
+            when a_unnorm is constant (e has only its first entry > 0).
 
     Notes:
     - dec_gate is accepted for backward compatibility but ignored.
@@ -36,21 +42,28 @@ class MonotoneHead(nn.Module):
         high: float,
     ) -> torch.Tensor:
         # logits: (..., K), top_gate: (..., 1)
-        # Positive increments and normalized previous-cumulative profile in [0,1]
-        d = F.softplus(logits) + self.eps  # (..., K)
-        cum = torch.cumsum(d, dim=-1)  # (..., K)
-        # previous cumulative: prepend 0 and drop last element
-        zeros = torch.zeros_like(d[..., :1])
-        c_prev = torch.cat([zeros, cum[..., :-1]], dim=-1)
-        denom = torch.clamp(cum[..., -1:] - d[..., -1:], min=self.eps)  # sum_{j < K} d_j
-        c = c_prev / denom  # (..., K), c[0]=0, c[-1]=1
+        K = self.K
+        # Handle degenerate K=1 case
+        if K == 1:
+            top_frac = torch.sigmoid(top_gate / self.temp)
+            top = low + (high - low) * top_frac
+            return top
+
+        # First-difference magnitudes (length K-1), enforced non-decreasing by cumulative sum
+        e = F.softplus(logits[..., : K - 1]) + self.eps            # (..., K-1)
+        a_unnorm = torch.cumsum(e, dim=-1)                         # (..., K-1), non-decreasing
+        sum_a = torch.clamp(a_unnorm.sum(dim=-1, keepdim=True), min=self.eps)
+        w = a_unnorm / sum_a                                       # (..., K-1), sum to 1
+        csum_w = torch.cumsum(w, dim=-1)                           # (..., K-1), last=1
+        zeros = torch.zeros_like(csum_w[..., :1])
+        C = torch.cat([zeros, csum_w], dim=-1)                     # (..., K), C[0]=0, C[-1]=1
 
         # Top within [low, high] using softened sigmoid
         top_frac = torch.sigmoid(top_gate / self.temp)  # (..., 1)
         top = low + (high - low) * top_frac
 
         # Monotone non-increasing thresholds
-        y = top - (top - low) * c
+        y = top - (top - low) * C
         return y
 
 
@@ -125,6 +138,12 @@ class ThresholdPredictor(nn.Module):
         y_fd = self.mono(
             self.flex_d_head_logits(h), self.flex_d_head_top(h), self.flex_d_head_dec(h), lb, ub
         )
+
+        # fixed offset (to be added to predicted vector) (K-1)e-5 at location 0, (K-2)e-5 at location 1, 1e-5 at location -2, ..., 0 at location -1
+        offsets = torch.arange(self.mono.K - 1, -1, -1, dtype=y_base.dtype, device=y_base.device) * 1e-5
+        y_base = y_base + offsets
+        y_fp = y_fp + offsets
+        y_fd = y_fd + offsets
 
         if squeeze_out:
             return y_base[0], y_fp[0], y_fd[0]

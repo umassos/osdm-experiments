@@ -1,6 +1,7 @@
 import cvxpy as cp
 import numpy as np
 from cvxpylayers.torch import CvxpyLayer
+import torch
 
 """
 PALD CVXPyLayers with integral-aware (per-segment) allocation.
@@ -171,3 +172,63 @@ def make_pald_flex_delivery_layer(K):
     )
 
     return layer
+
+
+# differentiable torch objective function
+# NOTE: Keep everything as torch ops; avoid Python floats that can break the graph.
+def torch_objective(p_seq, x_seq, z_seq, gamma, delta, c, eps):
+    """Torch version of objective_function for differentiable PALD cost.
+    Inputs are torch 1D tensors of length T (float32).
+    Mirrors paad_implementation.objective_function.
+    """
+    Tn = p_seq.shape[0]
+    # state of charge s[0..T]
+    s = []
+    s_prev = torch.zeros(1, dtype=p_seq.dtype, device=p_seq.device)
+    s.append(s_prev)
+    for t in range(1, Tn + 1):
+        s_t = torch.clamp(s_prev + x_seq[t - 1] - z_seq[t - 1], min=0.0)
+        s.append(s_t)
+        s_prev = s_t
+    s_torch = torch.cat(s, dim=0)
+
+    # Costs
+    cost_purchasing = (p_seq * x_seq).sum()
+    switching_cost_x = gamma * (x_seq[1:] - x_seq[:-1]).abs().sum() if Tn > 1 else torch.tensor(0.0)
+    switching_cost_z = delta * (z_seq[1:] - z_seq[:-1]).abs().sum() if Tn > 1 else torch.tensor(0.0)
+    s_prev_seq = s_torch[:-1]
+    discharge_cost = (p_seq * (c * z_seq + eps * z_seq - c * s_prev_seq * z_seq)).sum()
+    return cost_purchasing + switching_cost_x + switching_cost_z + discharge_cost
+
+def hinge_from_y_torch(taus_full_t: torch.Tensor, y: torch.Tensor):
+    """
+    taus_full_t: torch tensor of shape (K+1,), constant breakpoints [τ0,...,τK]
+    y:           torch tensor of shape (K+1,) or (B, K+1), values g(τ_j)=y_j
+
+    Returns:
+      w_hinge: (K,) or (B, K), nonneg hinge weights
+      c1:      ()  or (B,),   slope term for F; c1 = -y[..., 0]
+    """
+    # Ensure taus on same device/dtype as y
+    taus_full_t = taus_full_t.to(device=y.device, dtype=y.dtype)
+
+    # Differences along the last dimension
+    dt = taus_full_t[1:] - taus_full_t[:-1]                     # (K,)
+    dy = y[..., 1:] - y[..., :-1]                               # (..., K)
+
+    # Slopes of g on segments, then curvatures of F
+    a = dy / dt                                                 # (..., K)
+    s = -a                                                      # (..., K)
+
+    # Hinge weights are curvature jumps
+    w0 = s[..., :1]                                             # (..., 1)
+    wj = s[..., 1:] - s[..., :-1]                               # (..., K-1)
+    w = torch.cat([w0, wj], dim=-1)                             # (..., K)
+
+    # Nonnegativity projection; subgradients pass where w>0
+    # w = torch.clamp(w, min=0.0)
+
+    # c1 = -g(τ0) = -y[..., 0]
+    c1 = -y[..., 0]
+
+    return w, c1

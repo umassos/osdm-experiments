@@ -2,7 +2,7 @@ import math
 import torch
 import cvxpy as cp
 from functions import load_scenarios_with_flexible
-from pald_implementation import (
+from pald_static_implementation import (
     make_pald_base_layer,
     make_pald_flex_purchase_layer,
     make_pald_flex_delivery_layer,
@@ -24,27 +24,37 @@ except Exception:
     opt_sol = None
     _HAS_GUROBI = False
 
-# -------------------------
-# Config
-# -------------------------
-T = 48
-S = 1.0
-K = 10
-gamma = 10.0
-delta = 5.0
-c_delivery = 0.2
-eps_delivery = 0.05
+
 
 # Use the same (no-op) solver_args as in train_pald.py calls for consistency
 solver_options = {"solve_method": "ECOS"}  # diffcp still uses SCS internally
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate PALD-Fast and PAAD over many instances.")
-    parser.add_argument("--num_instances", type=int, default=100, help="Number of instances to evaluate (default: 1)")
-    parser.add_argument("--trace", type=str, default="CAISO", help="Trace name (default from file config)")
-    parser.add_argument("--thres_file", type=str, default="best_thresholds.pkl", help="File with learned thresholds (pickle)")
-    parser.add_argument("--analytical", action="store_true", help="Use analytical thresholds instead of learned")
-    return parser.parse_args()
+parser = argparse.ArgumentParser(description="Evaluate PALD-Fast and PAAD over many instances.")
+parser.add_argument("--num_instances", type=int, default=100, help="Number of instances to evaluate (default: 1)")
+parser.add_argument("--trace", type=str, default="CAISO", help="Trace name (default from file config)")
+parser.add_argument("--thres_file", type=str, default="best_thresholds.pkl", help="File with learned thresholds (pickle)")
+parser.add_argument("--analytical", action="store_true", help="Use analytical thresholds instead of learned")
+parser.add_argument("--T", type=int, default=48, help="Time horizon (default: 48)")
+parser.add_argument("--gamma", type=float, default=10.0, help="Gamma switching cost parameter (default: 10.0)")
+parser.add_argument("--delta", type=float, default=5.0, help="Delta switching cost parameter (default: 5.0)")
+parser.add_argument("--c_delivery", type=float, default=0.2, help="Delivery cost coefficient (default: 0.2)")
+parser.add_argument("--eps_delivery", type=float, default=0.05, help="Delivery cost epsilon (default: 0.05)")
+parser.add_argument("--scale_factor", type=float, default=40.0, help="Scale factor for demands (default: 40.0)")
+parser.add_argument("--proportion_base", type=float, default=0.5, help="Proportion of base demand (default: 0.5)")
+args = parser.parse_args()
+
+# -------------------------
+# Config
+# -------------------------
+T = args.T
+S = 1.0
+K = 10
+gamma = args.gamma
+delta = args.delta
+c_delivery = args.c_delivery
+eps_delivery = args.eps_delivery
+scale_factor = args.scale_factor
+proportion_base = args.proportion_base
 
 # -------------------------
 # Helpers reused from train_pald.py (no training)
@@ -362,10 +372,10 @@ def evaluate_many(price_all, base_all, flex_all, Delta_all, p_min, p_max, y_base
 
     # check if optimal solutions are saved
     total_instances = args.num_instances
-    if os.path.exists(f"opt_sols/opt_costs_flex_{args.trace}_{month}_{args.num_instances}.pkl"):
-        with open(f"opt_sols/opt_costs_flex_{args.trace}_{month}_{args.num_instances}.pkl", "rb") as f:
+    if os.path.exists(f"eval_opt_sols/opt_costs_flex_{args.trace}_{month}_{args.num_instances}.pkl"):
+        with open(f"eval_opt_sols/opt_costs_flex_{args.trace}_{month}_{args.num_instances}.pkl", "rb") as f:
             opt_costs, total_demands_saved = pickle.load(f)
-        print(f"Loaded precomputed OPT costs for flexible demand from opt_sols/opt_costs_flex_{args.trace}_{month}_{args.num_instances}.pkl") 
+        print(f"Loaded precomputed OPT costs for flexible demand from eval_opt_sols/opt_costs_flex_{args.trace}_{month}_{args.num_instances}.pkl") 
         opt_recompute = False
 
     for idx in range(num_instances):
@@ -442,16 +452,14 @@ def evaluate_many(price_all, base_all, flex_all, Delta_all, p_min, p_max, y_base
     return rows
 
 def main():
-    args = parse_args()
-    
-    max_month = 3
+    max_month = 12
 
     print(f"Evaluating {args.num_instances} instances (trace={args.trace})...")
     month_data = []
     threshold_data = []
     for month in range(1, max_month + 1):
         price_all, base_all, flex_all, Delta_all, p_min, p_max = load_scenarios_with_flexible(
-            args.num_instances, T, args.trace, month=month
+            args.num_instances, T, args.trace, month=month, eval=True, scale_factor=scale_factor, proportion_base=proportion_base
         )
         month_data.append((price_all, base_all, flex_all, Delta_all, p_min, p_max))
     
@@ -539,6 +547,21 @@ def main():
     print_summary("PALD/OPT", ratios_pald)
     print_summary("PAAD/OPT", ratios_paad)
 
+    # T = args.T
+    # S = 1.0
+    # K = 10
+    # gamma = args.gamma
+    # delta = args.delta
+    # c_delivery = args.c_delivery
+    # eps_delivery = args.eps_delivery
+
+    # Save detailed results to a pickle file
+    output_file = f'eval_results/{args.trace}_T{args.T}_gamma{args.gamma}_delta{args.delta}_c{args.c_delivery}_eps{args.eps_delivery}_prop{proportion_base}_scale{scale_factor}.pkl'
+    os.makedirs('eval_results', exist_ok=True)
+    with open(output_file, 'wb') as f:
+        pickle.dump(rows, f)
+    print(f"Saved detailed results to {output_file}")
+
     # plot CDF of the ratios
     try:
         import matplotlib.pyplot as plt
@@ -561,9 +584,9 @@ def main():
         plt.grid(True)
         plt.xlim(1, 4)
         plt.ylim(0, 1)
-        plt.savefig('comp_ratio_cdf.png')
+        plt.savefig(f'comp_ratio_cdf_{args.trace}.png')
         plt.close()
-        print("Saved CDF plot to comp_ratio_cdf.png")
+        print(f"Saved CDF plot to comp_ratio_cdf_{args.trace}.png")
     except ImportError:
         print("matplotlib not installed, skipping CDF plot.")
 
