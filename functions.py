@@ -180,6 +180,7 @@ def load_scenarios_with_flexible_context(num_scenarios, T, trace_name, proportio
     # first check for a pickled file in demand_traces
     if saved:
         pickle_filename = f"demand_traces/{trace_name}_month{month}_num{num_scenarios}_deadline{T}_prop{proportion_base}_CONTEXT.pkl"
+        
         try:
             with open(pickle_filename, "rb") as f:
                 price_scenarios, forecast_scenarios, base_scenarios, flex_scenarios, Delta_scenarios = pickle.load(f)

@@ -35,7 +35,7 @@ parser.add_argument('--batch_size', type=int, default=100, help='Batch size for 
 parser.add_argument('--num_batches', type=int, default=1, help='Number of batches per epoch (default: 1)')
 parser.add_argument('--use_cost_loss', action='store_true', help='Use total cost loss instead of competitive-ratio loss')
 parser.add_argument('--pretraining_loop', type=int, default=200, help='Number of epochs to pretrain with random thresholds (default: 200)')
-parser.add_argument('--trace', type=str, default="ERCOT", help='Trace name to use (default: ERCOT)')
+parser.add_argument('--trace', type=str, default="PJM", help='Trace name to use (default: PJM)')
 parser.add_argument('--month', type=int, default=1, help='Month to filter for in trace (default: 1, 99 for all)')
 args = parser.parse_args()
 
@@ -127,7 +127,7 @@ opt_costs_all, total_demands_all = precompute_opt_costs_flex(price_all, base_all
 num_opt_ok = sum(1 for v in (opt_costs_all or []) if (v is not None and v > 1e-6))
 print(f"OPT costs available for {num_opt_ok}/{total_instances} instances.")
 
-exit(0)
+# exit(0)
 
 # Keep analytical threshold utilities for plotting comparison
 def base_threshold(w: float, p_min: float, p_max: float, gamma: float, delta: float, c: float, eps: float, T: int, alpha: float, b: float = 1.0) -> float:

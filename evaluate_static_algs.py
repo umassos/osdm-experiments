@@ -170,7 +170,7 @@ def _build_pald_flex_delivery_cvx(K, delta):
     prob = cp.Problem(obj, constraints)
     return {"prob": prob, "z_prev": z_prev, "v_prev": v_prev, "coeff": coeff, "y_vec": y_vec, "caps": caps, "z_total": z_total}
 
-_CLARABEL_KW = dict(solver=cp.CLARABEL, verbose=False, warm_start=True)
+# _CLARABEL_KW = dict(solver=cp.CLARABEL, verbose=False, warm_start=True)
 
 def _solve_base_cvx(model, x_prev, w_prev, p_t, y_vec, caps):
     if (1.0 - w_prev) <= 1e-12 or (sum(caps) <= 1e-12):
@@ -181,7 +181,7 @@ def _solve_base_cvx(model, x_prev, w_prev, p_t, y_vec, caps):
     model["y_vec"].value = list(map(float, y_vec))
     model["caps"].value = list(map(float, caps))
     try:
-        model["prob"].solve(**_CLARABEL_KW)
+        model["prob"].solve()
         val = model["x_total"].value
         return max(0.0, float(val) if val is not None else 0.0)
     except Exception:
@@ -199,7 +199,7 @@ def _solve_flex_delivery_cvx(model, z_prev, v_prev, coeff, y_vec, caps):
     model["y_vec"].value = list(map(float, y_vec))
     model["caps"].value = list(map(float, caps))
     try:
-        model["prob"].solve(**_CLARABEL_KW)
+        model["prob"].solve()
         val = model["z_total"].value
         return max(0.0, float(val) if val is not None else 0.0)
     except Exception:
@@ -357,6 +357,9 @@ def evaluate_many(price_all, base_all, flex_all, Delta_all, p_min, p_max, y_base
     num_instances = len(price_all)
     print(f"Evaluating {num_instances} instances...")
 
+    # print details of the current evaluation
+    print("trace:", args.trace, "p_min:", p_min, "p_max:", p_max)
+
     models = _build_models_once(K, gamma, delta)
 
     pald_costs = []
@@ -392,12 +395,16 @@ def evaluate_many(price_all, base_all, flex_all, Delta_all, p_min, p_max, y_base
         pald_cost = np_objective_function(T, p_seq, gamma, delta, c_delivery, eps_delivery, pald_x, pald_z)
 
         # PAAD
-        paad_res = pi.paad_algorithm(T, p_seq, gamma, delta,
-                                     c_delivery, eps_delivery,
-                                     p_min, p_max, S, b_seq, f_seq, D_seq)
-        paad_x = paad_res["x"]
-        paad_z = paad_res["z"]
-        paad_cost = np_objective_function(T, p_seq, gamma, delta, c_delivery, eps_delivery, paad_x, paad_z)
+        try:
+            paad_res = pi.paad_algorithm(T, p_seq, gamma, delta,
+                                        c_delivery, eps_delivery,
+                                        p_min, p_max, S, b_seq, f_seq, D_seq)
+            paad_x = paad_res["x"]
+            paad_z = paad_res["z"]
+            paad_cost = np_objective_function(T, p_seq, gamma, delta, c_delivery, eps_delivery, paad_x, paad_z)
+        except Exception as e:
+            print(f"PAAD failed on instance {idx} with error: {e}")
+            continue
 
         pald_costs.append(pald_cost)
         paad_costs.append(paad_cost)
@@ -459,8 +466,13 @@ def main():
     threshold_data = []
     for month in range(1, max_month + 1):
         price_all, base_all, flex_all, Delta_all, p_min, p_max = load_scenarios_with_flexible(
-            args.num_instances, T, args.trace, month=month, eval=True, scale_factor=scale_factor, proportion_base=proportion_base
+            args.num_instances, T, args.trace, month=month, eval=True, scale_factor=40.0, proportion_base=proportion_base
         )
+        if scale_factor != 40.0:
+            # rescale demands by the new scale factor (e.g., if scale factor = 80, divide all demands by 2)
+            divisor = scale_factor / 40.0
+            base_all = [[b / divisor for b in seq] for seq in base_all]
+            flex_all = [[f / divisor for f in seq] for seq in flex_all]
         month_data.append((price_all, base_all, flex_all, Delta_all, p_min, p_max))
     
         if args.analytical:

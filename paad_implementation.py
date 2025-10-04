@@ -112,7 +112,7 @@ class BaseDriver:
         x = cp.Variable(nonneg=True)
         constraints = [0 <= x, x <= (self.b - self.w)]
         prob = cp.Problem(cp.Minimize(self.pcBaseMinimization(x, curr_price)), constraints)
-        prob.solve(solver=cp.CLARABEL)
+        prob.solve()
         target = x.value
 
         # check if target is none
@@ -196,7 +196,7 @@ class FlexibleDriver:
         x = cp.Variable(nonneg=True)
         constraints = [0 <= x, x <= (self.f - self.w)]
         prob = cp.Problem(cp.Minimize(self.pcPurchaseMinimization(x, curr_price)), constraints)
-        prob.solve(solver=cp.CLARABEL)
+        prob.solve()
         target = x.value
 
         # check if target is none
@@ -268,7 +268,7 @@ class FlexibleDriver:
 
         # Otherwise, solve CVX and cap by purchased remainder
         prob = cp.Problem(cp.Minimize(self.pcDeliveryMinimization(z, curr_price, storage_state)), constraints)
-        prob.solve(solver=cp.CLARABEL)
+        prob.solve()
         target = z.value if z.value is not None else 0.0
 
         # cannot deliver more than purchased so far (before deadline)
