@@ -3,35 +3,37 @@ import cvxpy as cp
 from scipy.special import lambertw
 import scipy.integrate as integrate
 
-# implements the OSDM objective function outside of Gurobi 
+# implements the OSDM TRACKING objective function outside of Gurobi 
 def objective_function(
     T: int,
     p: list[float],
-    gamma: float,
+    eta: float,
     delta: float,
     c_delivery: float,
     eps_delivery: float,
     x: list[float],
-    z: list[float]
+    z: list[float],
+    a: list[float]
 ) -> float:
     """
-    Computes the objective function value for the OSDM problem.
+    Computes the objective function value for the OSDM problem with tracking.
 
     Args:
         T (int): The time horizon.
         p (list): A list of prices p_t for t in [1, T].
-        gamma (float): Switching cost parameter for x.
+        eta (float): Tracking cost parameter for x.
         delta (float): Switching cost parameter for z.
         c_delivery (float): Parameter for the discharge cost function.
         eps_delivery (float): Parameter for the discharge cost function (eps_delivery < c_delivery).
         x (list): A list of charge values x_t for t in [1, T].
         z (list): A list of discharge values z_t for t in [1, T].
+        a (list): A list of tracking target values a_t for t in [1, T].
 
     Returns:
         float: The computed objective function value.
     """
-    if not (len(p) == T and len(x) == T and len(z) == T):
-        raise ValueError("Length of price, x, and z lists must equal T.")
+    if not (len(p) == T and len(x) == T and len(z) == T and len(a) == T):
+        raise ValueError("Length of price, x, z, and a lists must equal T.")
 
     obj_value = 0.0
 
@@ -53,10 +55,13 @@ def objective_function(
     cost_purchasing = sum(p[t-1] * x_new[t] for t in range(1, T+1))
     obj_value += cost_purchasing
 
+    # Tracking costs (L1 norm)
+    tracking_cost = sum(eta * abs(x_new[t] - a[t-1]) for t in range(1, T+1))
+    obj_value += tracking_cost
+
     # Switching costs (L1 norm)
-    switching_cost_x = sum(gamma * abs(x_new[t] - x_new[t - 1]) for t in range(1, T+1))
     switching_cost_z = sum(delta * abs(z_new[t] - z_new[t - 1]) for t in range(1, T+1))
-    obj_value += (switching_cost_x + switching_cost_z)
+    obj_value += switching_cost_z
 
     # Discharge costs.   # p_1 * (c_delivery * z_1 + eps_delivery * z_1 - c_delivery * z_1 * s_0) + ...   
     discharge_cost = sum(p[t-1] * (c_delivery * z_new[t] + eps_delivery * z_new[t] - c_delivery * z_new[t] * s[t-1]) for t in range(1, T+1))
@@ -64,12 +69,13 @@ def objective_function(
 
     return obj_value
 
+
 # define object for each ''driver''
 class BaseDriver:
-    def __init__(self, id: int, b: float, gamma: float, delta: float, alpha: float, p_min: float, p_max: float, c_delivery: float, eps_delivery: float, T: int):
+    def __init__(self, id: int, b: float, eta: float, delta: float, alpha: float, p_min: float, p_max: float, c_delivery: float, eps_delivery: float, T: int):
         self.id = id
         self.b = b
-        self.gamma = gamma
+        self.eta = eta
         self.delta = delta
         self.alpha = alpha
         self.T = T
@@ -86,20 +92,20 @@ class BaseDriver:
         self.w = 0.0 # cumulative amount purchased so far
     
     def threshold(self, w: float):
-        p_min, p_max, alpha, gamma, delta, T = self.p_min, self.p_max, self.alpha, self.gamma, self.delta, self.T
+        p_min, p_max, alpha, eta, delta, T = self.p_min, self.p_max, self.alpha, self.eta, self.delta, self.T
         c, eps = self.c_delivery, self.eps_delivery
         b = self.b
-        lhs = p_max + 2*gamma + p_min *c
-        inside_exp = (p_max * (1 + c+ eps) + 2*(gamma+delta))/(alpha) - p_max*(1+eps) - p_min * c - 2*(gamma+delta)/T
+        lhs = p_max + 2*eta + p_min *c
+        inside_exp = (p_max * (1 + c+ eps) + 2*(eta+delta))/(alpha) - p_max*(1+eps) - p_min * c - 2*(delta)/T
         rhs = (inside_exp)*np.exp((w)/(alpha*b))
         return lhs + rhs
 
     def thresholdAntiDeriv(self, w: float):
-        p_min, p_max, alpha, gamma, delta, T = self.p_min, self.p_max, self.alpha, self.gamma, self.delta, self.T
+        p_min, p_max, alpha, eta, delta, T = self.p_min, self.p_max, self.alpha, self.eta, self.delta, self.T
         c, eps = self.c_delivery, self.eps_delivery
         b = self.b
-        lhs = (p_max + 2*gamma + p_min *c)*w
-        inside_exp = (p_max * (1 + c+ eps) + 2*(gamma+delta))/(alpha) - (p_max*(1+eps) + p_min * c + 2*(gamma+delta)/T)
+        lhs = (p_max + 2*eta + p_min *c)*w
+        inside_exp = (p_max * (1 + c+ eps) + 2*(eta+delta))/(alpha) - (p_max*(1+eps) + p_min * c + 2*(delta)/T)
         rhs = (inside_exp)*alpha*b*cp.exp((w)/(alpha*b))
         return lhs + rhs
 
@@ -107,10 +113,10 @@ class BaseDriver:
         ratio = self.prev_decision / total if total > 0 else 0
         self.pseudo_decision = self.prev_decision + max(0.0, excess * ratio)
 
-    def get_x_decision(self, curr_price: float):
+    def get_x_decision(self, a, curr_price: float):
         x = cp.Variable(nonneg=True)
         constraints = [0 <= x, x <= (self.b - self.w)]
-        prob = cp.Problem(cp.Minimize(self.pcBaseMinimization(x, curr_price)), constraints)
+        prob = cp.Problem(cp.Minimize(self.pcBaseMinimization(x, a, curr_price)), constraints)
         prob.solve()
         target = x.value
 
@@ -122,22 +128,21 @@ class BaseDriver:
         self.w += target
         return target
     
-    def pcBaseMinimization(self, x, curr_price):
-        prev = self.pseudo_decision
+    def pcBaseMinimization(self, x, a, curr_price):
         hit_cost = (curr_price * x)
-        switch_cost = self.gamma * cp.abs(x - prev) + self.gamma * cp.abs(x)
+        track_cost = self.eta * cp.abs(x - a) 
         # pseudo_cost = integrate.quad(self.threshold, self.w, self.w + x)[0]
         pseudo_cost = self.thresholdAntiDeriv(self.w + x) - self.thresholdAntiDeriv(self.w)
-        return hit_cost + switch_cost - pseudo_cost
+        return hit_cost + track_cost - pseudo_cost
 
 
 
 class FlexibleDriver:
-    def __init__(self, id: int, f: float, delta_f: float, gamma: float, delta: float, alpha: float, p_min: float, p_max: float, c_delivery: float, eps_delivery: float, T: int):
+    def __init__(self, id: int, f: float, delta_f: float, eta: float, delta: float, alpha: float, p_min: float, p_max: float, c_delivery: float, eps_delivery: float, T: int):
         self.id = id
         self.f = f
         self.delta_f = delta_f
-        self.gamma = gamma
+        self.eta = eta
         self.delta = delta
         self.alpha = alpha
         self.T = T
@@ -169,32 +174,32 @@ class FlexibleDriver:
         self.pseudo_delivery_decision = self.prev_delivery_decision + max(0.0, excess*ratio)
 
     def purchasing_threshold(self, w: float):
-        p_min, p_max, alpha, gamma, T = self.p_min, self.p_max, self.alpha_prime, self.gamma, self.T
+        p_min, p_max, alpha, eta, T = self.p_min, self.p_max, self.alpha_prime, self.eta, self.T
         c, eps = self.c_delivery, self.eps_delivery
         omega = (1 + c + eps)/(1 + eps)
         f = self.f
-        lhs = p_max + 2*gamma + p_min *c
-        inside_exp = (p_max + 2*(gamma))/(alpha) - (p_max + p_min * c + ((2*(gamma)/T) * omega))
+        lhs = p_max + 2*eta + p_min *c
+        inside_exp = (p_max + 2*(eta))/(alpha) - (p_max + p_min * c)
         rhs = (inside_exp)*np.exp((w)/(alpha*f))
         return lhs + rhs
     
     def purchasing_thresholdAntiDeriv(self, w: float):
-        p_min, p_max, alpha, gamma, T = self.p_min, self.p_max, self.alpha_prime, self.gamma, self.T
+        p_min, p_max, alpha, eta, T = self.p_min, self.p_max, self.alpha_prime, self.eta, self.T
         c, eps = self.c_delivery, self.eps_delivery
         omega = (1 + c + eps)/(1 + eps)
         f = self.f
-        lhs = (p_max + 2*gamma + p_min *c)*w
-        inside_exp = (p_max + 2*(gamma))/(alpha) - (p_max + p_min * c + ((2*(gamma)/T) * omega))
+        lhs = (p_max + 2*eta + p_min *c)*w
+        inside_exp = (p_max + 2*(eta))/(alpha) - (p_max + p_min * c)
         rhs = (inside_exp)*alpha*f*cp.exp((w)/(alpha*f))
         return lhs + rhs
 
     def set_pseudo_decision(self, excess: float):
         self.pseudo_decision = self.prev_decision + max(0.0, excess)
     
-    def get_x_decision(self, curr_price: float, time_step: int):
+    def get_x_decision(self, a, curr_price: float, time_step: int):
         x = cp.Variable(nonneg=True)
         constraints = [0 <= x, x <= (self.f - self.w)]
-        prob = cp.Problem(cp.Minimize(self.pcPurchaseMinimization(x, curr_price)), constraints)
+        prob = cp.Problem(cp.Minimize(self.pcPurchaseMinimization(x, a, curr_price)), constraints)
         prob.solve()
         target = x.value
 
@@ -217,13 +222,12 @@ class FlexibleDriver:
 
         return self.prev_purchasing_decision
     
-    def pcPurchaseMinimization(self, x, curr_price):
-        prev = self.pseudo_purchasing_decision
+    def pcPurchaseMinimization(self, x, a, curr_price):
         hit_cost = (curr_price * x)
-        switch_cost = self.gamma * cp.abs(x - prev) + self.gamma * cp.abs(x)
+        track_cost = self.eta * cp.abs(x - a)
         # pseudo_cost = integrate.quad(self.purchasing_threshold, self.w, self.w + x)[0]
         pseudo_cost = self.purchasing_thresholdAntiDeriv(self.w + x) - self.purchasing_thresholdAntiDeriv(self.w)
-        return hit_cost + switch_cost - pseudo_cost
+        return hit_cost + track_cost - pseudo_cost
     
     def delivery_threshold(self, v: float):
         p_max, alpha, delta, T = self.p_max, self.alpha_prime, self.delta, self.T
@@ -285,14 +289,14 @@ class FlexibleDriver:
         pseudo_cost = self.delivery_thresholdAntiDeriv(self.v + z) - self.delivery_thresholdAntiDeriv(self.v)
         return hit_cost + switch_cost - pseudo_cost
 
-def get_alpha(p_min: float, p_max: float, c: float, eps: float, T: int, gamma: float, delta: float) -> float:
+def get_alpha(p_min: float, p_max: float, c: float, eps: float, T: int, eta: float, delta: float) -> float:
     """
     Computes the competitive ratio alpha for the PAAD algorithm.
     """
     omega = (1 + c + eps) / (1 + eps)
-    inner_frac = ((omega*(2*(gamma+delta)/T) - p_min*c - (1+c+eps)*p_max)/((1+c+eps)*p_max + 2*(gamma+delta)))
+    inner_frac = ((omega*(2*(delta)/T) - p_min*c - (1+c+eps)*p_max)/((1+c+eps)*p_max + 2*(eta+delta)))
     numerator = ((1+c+eps)*p_max - (1+eps)*p_min) * np.exp(inner_frac)
-    denominator = -1* ((1+c+eps)*p_max + 2*(gamma+delta))
+    denominator = -1* ((1+c+eps)*p_max + 2*(eta+delta))
     W_term = lambertw(numerator/denominator, k=0).real
     alpha = (omega) / (W_term - inner_frac)
 
@@ -301,7 +305,7 @@ def get_alpha(p_min: float, p_max: float, c: float, eps: float, T: int, gamma: f
 def paad_algorithm(
     T: int,
     p: list[float],
-    gamma: float,
+    eta: float,
     delta: float,
     c_delivery: float,
     eps_delivery: float,
@@ -311,6 +315,7 @@ def paad_algorithm(
     b: list[float],
     f: list[float],
     Delta_f: list[float],
+    a: list[float],
     s_0: float = 0.0,
     x_0: float = 0.0,
     z_0: float = 0.0
@@ -321,7 +326,7 @@ def paad_algorithm(
     Args:
         T (int): The time horizon.
         p (list): A list of prices p_t for t in [1, T].
-        gamma (float): Ramping cost parameter for x.
+        eta (float): Ramping cost parameter for x.
         delta (float): Ramping cost parameter for z.
         c_delivery (float): Parameter for the discharge cost function.
         eps_delivery (float): Parameter for the discharge cost function (eps_delivery < c_delivery).
@@ -331,6 +336,7 @@ def paad_algorithm(
         b (list): A list of lower bounds b_t for z_t for t in [1, T]. (base demand values)
         f (list): A list of values f_t for the upper bound on z_t. (flexible demand values)
         Delta_f (list): A list of deadline values -- f[i] must be delivered by time Delta_f[i].
+        a (list): A list of tracking target values a_t for t in [1, T].
         s_0 (float): Initial state of the inventory.
         x_0 (float): Initial charge value at t=0.
         z_0 (float): Initial discharge value at t=0.
@@ -350,26 +356,27 @@ def paad_algorithm(
     flexible_drivers = set()
 
     # get value of alpha (competitive ratio)
-    alpha = get_alpha(p_min, p_max, c_delivery, eps_delivery, 96, gamma, delta) 
+    alpha = get_alpha(p_min, p_max, c_delivery, eps_delivery, 96, eta, delta) 
     # print(f"Computed alpha: {alpha}")
 
     # add base driver with size S to the system at initialization
-    new_driver = BaseDriver(id=0, b=S, gamma=gamma, delta=delta, alpha=alpha, p_min=p_min, p_max=p_max, c_delivery=c_delivery, eps_delivery=eps_delivery, T=T)
+    new_driver = BaseDriver(id=0, b=S, eta=eta, delta=delta, alpha=alpha, p_min=p_min, p_max=p_max, c_delivery=c_delivery, eps_delivery=eps_delivery, T=T)
     base_drivers.add(new_driver)
 
     # simulate behavior of online algorithm using a for loop
     for (t, curr_price) in enumerate(p):
         b_t = b[t]
         f_t = f[t]
+        a_t = a[t]
         delta_f_t = Delta_f[t]
 
         # if base demand is non-zero, add a new base driver
         if b_t > 0:
-            new_driver = BaseDriver(id=(t+1)*2, b=b_t, gamma=gamma, delta=delta, alpha=alpha, p_min=p_min, p_max=p_max, c_delivery=c_delivery, eps_delivery=eps_delivery, T=T)
+            new_driver = BaseDriver(id=(t+1)*2, b=b_t, eta=eta, delta=delta, alpha=alpha, p_min=p_min, p_max=p_max, c_delivery=c_delivery, eps_delivery=eps_delivery, T=T)
             base_drivers.add(new_driver)
         # if flexible demand is non-zero, add a new flexible driver
         if f_t > 0:
-            new_driver = FlexibleDriver(id=(t+1)*2+1, f=f_t, delta_f=delta_f_t, gamma=gamma, delta=delta, alpha=alpha, p_min=p_min, p_max=p_max, c_delivery=c_delivery, eps_delivery=eps_delivery, T=T)
+            new_driver = FlexibleDriver(id=(t+1)*2+1, f=f_t, delta_f=delta_f_t, eta=eta, delta=delta, alpha=alpha, p_min=p_min, p_max=p_max, c_delivery=c_delivery, eps_delivery=eps_delivery, T=T)
             flexible_drivers.add(new_driver)
         # compute pseudo-decisions
         prev_purchasing_decisions = 0.0
@@ -395,12 +402,12 @@ def paad_algorithm(
 
         # for each base driver, compute its x decision
         for driver in base_drivers:
-            x = driver.get_x_decision(curr_price)
+            x = driver.get_x_decision(a_t, curr_price)
             base_x_decisions.append(x)
         
         # for each flexible driver, compute its x and z decisions
         for driver in flexible_drivers:
-            x = driver.get_x_decision(curr_price, t)
+            x = driver.get_x_decision(a_t, curr_price, t)
             flexible_x_decisions.append(x)
             storage_state = s_sol[-1]/S if S > 0 else 0.0
             z = driver.get_z_decision(curr_price, t, storage_state)
@@ -424,7 +431,7 @@ def paad_algorithm(
         # if the storage is empty, remove all base drivers and initialize a new one with size S
         if s_t <= 0.0:
             base_drivers = set()
-            new_driver = BaseDriver(id=0, b=S, gamma=gamma, delta=delta, alpha=alpha, p_min=p_min, p_max=p_max, c_delivery=c_delivery, eps_delivery=eps_delivery, T=T)
+            new_driver = BaseDriver(id=0, b=S, eta=eta, delta=delta, alpha=alpha, p_min=p_min, p_max=p_max, c_delivery=c_delivery, eps_delivery=eps_delivery, T=T)
             base_drivers.add(new_driver)
 
     # Store the total evolution of the system
@@ -432,7 +439,7 @@ def paad_algorithm(
         'x': x_sol[1:],  # exclude initial condition
         'z': z_sol[1:],  # exclude initial condition
         's': s_sol,      # include initial condition
-        'obj_val': objective_function(T, p, gamma, delta, c_delivery, eps_delivery, x_sol[1:], z_sol[1:])
+        'obj_val': objective_function(T, p, eta, delta, c_delivery, eps_delivery, x_sol[1:], z_sol[1:], a)
     }
 
     return results

@@ -1,6 +1,7 @@
 import math
 import torch
 import cvxpy as cp
+import numpy as np
 from functions import load_scenarios_with_flexible
 from pald_static_implementation import (
     make_pald_base_layer,
@@ -9,13 +10,16 @@ from pald_static_implementation import (
 )
 from paad_implementation import get_alpha
 import paad_implementation as pi
+import paad_tracking_implementation as pti
 from paad_implementation import objective_function as np_objective_function
+from paad_tracking_implementation import objective_function as np_tracking_objective_function
 import argparse
 import csv
 import statistics
 from typing import List, Dict, Any
 import pickle
 import os
+import random
 
 try:
     import opt_sol  # offline optimal via Gurobi
@@ -41,6 +45,7 @@ parser.add_argument("--c_delivery", type=float, default=0.2, help="Delivery cost
 parser.add_argument("--eps_delivery", type=float, default=0.05, help="Delivery cost epsilon (default: 0.05)")
 parser.add_argument("--scale_factor", type=float, default=40.0, help="Scale factor for demands (default: 40.0)")
 parser.add_argument("--proportion_base", type=float, default=0.5, help="Proportion of base demand (default: 0.5)")
+parser.add_argument("--eta", type=float, default=0.0, help="Tracking cost parameter eta (default: 0.0, no tracking cost)")
 args = parser.parse_args()
 
 # -------------------------
@@ -51,6 +56,9 @@ S = 1.0
 K = 10
 gamma = args.gamma
 delta = args.delta
+eta = args.eta
+if eta > 0.0:
+    gamma = 0.0
 c_delivery = args.c_delivery
 eps_delivery = args.eps_delivery
 scale_factor = args.scale_factor
@@ -98,41 +106,15 @@ def flex_delivery_threshold(v: float, p_min: float, p_max: float, gamma: float, 
     inside = (p_max * (c + eps) + 2.0 * delta) / alpha_p - (p_max * (c + eps) + (2.0 * delta / T) * omega)
     return lhs + inside * math.exp(v / (alpha_p * max(f, 1e-8)))
 
-# New: build manually tuned thresholds
-def build_tuned_thresholds(K, p_min, p_max, gamma, delta, c, eps, T, alpha):
-
-    # base pieces
-    # yb = [50, 50, 50, 50, 50, 50, 50, 50, 50, 50]
-    yb = [60 for _ in range(K)]
-
-    # flex purchase
-    # yp = [50, 50, 50, 50, 50, 50, 50, 50, 50, 50]
-    yp = [60 for _ in range(K)]
-
-    # flex delivery
-    # yd = [25, 25, 25, 25, 25, 25, 25, 25, 25, 25]
-    yd = [30 for _ in range(K)]
-          
-    # enforce non-increasing and pin tails
-    for i in range(1, K):
-        yb[i] = min(yb[i], yb[i - 1])
-        yp[i] = min(yp[i], yp[i - 1])
-        yd[i] = min(yd[i], yd[i - 1])
-    if K > 0:
-        yb[-1] = float(p_min) + 2.0 * gamma
-        yp[-1] = float(p_min) + 2.0 * gamma
-        yd[-1] = float(p_min) * (c + eps) + 2.0 * delta
-
-    return yb, yp, yd
-
 # -------------------------
 # Forward PALD (fast CVXPY variant, no cvxpylayers)
 # -------------------------
-def _build_pald_base_cvx(K, gamma):
+def _build_pald_base_cvx(K, gamma, eta):
     x_parts = cp.Variable(K, nonneg=True)
     x_total = cp.Variable(nonneg=True)
     # Parameters
     x_prev = cp.Parameter(nonneg=True)
+    a = cp.Parameter(nonneg=True)  # tracking target
     w_prev = cp.Parameter(nonneg=True)
     p_t = cp.Parameter()
     y_vec = cp.Parameter(K)
@@ -143,13 +125,13 @@ def _build_pald_base_cvx(K, gamma):
         x_total == cp.sum(x_parts),
         x_total <= 1 - w_prev,
     ]
-    obj = cp.Minimize(p_t * x_total + gamma * cp.abs(x_total - x_prev) + gamma * cp.abs(x_total) - y_vec @ x_parts)
+    obj = cp.Minimize(p_t * x_total + gamma * cp.abs(x_total - x_prev) + gamma * cp.abs(x_total) + eta * cp.abs(x_total - a)  - y_vec @ x_parts)
     prob = cp.Problem(obj, constraints)
-    return {"prob": prob, "x_prev": x_prev, "w_prev": w_prev, "p_t": p_t, "y_vec": y_vec, "caps": caps, "x_total": x_total}
+    return {"prob": prob, "x_prev": x_prev, "a": a, "w_prev": w_prev, "p_t": p_t, "y_vec": y_vec, "caps": caps, "x_total": x_total}
 
-def _build_pald_flex_purchase_cvx(K, gamma):
+def _build_pald_flex_purchase_cvx(K, gamma, eta):
     # identical to base, separate instance for clarity
-    return _build_pald_base_cvx(K, gamma)
+    return _build_pald_base_cvx(K, gamma, eta)
 
 def _build_pald_flex_delivery_cvx(K, delta):
     z_parts = cp.Variable(K, nonneg=True)
@@ -172,10 +154,11 @@ def _build_pald_flex_delivery_cvx(K, delta):
 
 # _CLARABEL_KW = dict(solver=cp.CLARABEL, verbose=False, warm_start=True)
 
-def _solve_base_cvx(model, x_prev, w_prev, p_t, y_vec, caps):
+def _solve_base_cvx(model, x_prev, a, w_prev, p_t, y_vec, caps):
     if (1.0 - w_prev) <= 1e-12 or (sum(caps) <= 1e-12):
         return 0.0
     model["x_prev"].value = max(0.0, float(x_prev))
+    model["a"].value = max(0.0, float(a))
     model["w_prev"].value = max(0.0, min(1.0, float(w_prev)))
     model["p_t"].value = float(p_t)
     model["y_vec"].value = list(map(float, y_vec))
@@ -187,8 +170,8 @@ def _solve_base_cvx(model, x_prev, w_prev, p_t, y_vec, caps):
     except Exception:
         return 0.0
 
-def _solve_flex_purchase_cvx(model, x_prev, w_prev, p_t, y_vec, caps):
-    return _solve_base_cvx(model, x_prev, w_prev, p_t, y_vec, caps)
+def _solve_flex_purchase_cvx(model, x_prev, a, w_prev, p_t, y_vec, caps):
+    return _solve_base_cvx(model, x_prev, a, w_prev, p_t, y_vec, caps)
 
 def _solve_flex_delivery_cvx(model, z_prev, v_prev, coeff, y_vec, caps):
     if (1.0 - v_prev) <= 1e-12 or (sum(caps) <= 1e-12):
@@ -205,15 +188,15 @@ def _solve_flex_delivery_cvx(model, z_prev, v_prev, coeff, y_vec, caps):
     except Exception:
         return 0.0
 
-def _build_models_once(K, gamma, delta):
+def _build_models_once(K, gamma, eta, delta):
     """Helper to build CVXPy models once and reuse (minor speedup)."""
-    base_m = _build_pald_base_cvx(K, gamma)
-    flex_p_m = _build_pald_flex_purchase_cvx(K, gamma)
+    base_m = _build_pald_base_cvx(K, gamma, eta)
+    flex_p_m = _build_pald_flex_purchase_cvx(K, gamma, eta)
     flex_d_m = _build_pald_flex_delivery_cvx(K, delta)
     return base_m, flex_p_m, flex_d_m
 
-def forward_pald_fast_reuse(models, price_seq, base_seq, flex_seq, Delta_seq,
-                             y_base, y_flex_p, y_flex_d, K, gamma, delta,
+def forward_pald_fast_reuse(models, price_seq, base_seq, flex_seq, Delta_seq, a_seq,
+                             y_base, y_flex_p, y_flex_d, K, gamma, eta, delta,
                              c_delivery, eps_delivery):
     """Same logic as forward_pald_fast but reusing pre-built CVXPy models."""
     base_m, flex_p_m, flex_d_m = models
@@ -228,6 +211,7 @@ def forward_pald_fast_reuse(models, price_seq, base_seq, flex_seq, Delta_seq,
     for t in range(T):
         b_t_val = float(base_seq[t])
         p_t_val = float(price_seq[t])
+        a_t_val = float(a_seq[t])
         # arrivals
         if b_t_val > 0:
             base_drivers.append({"id": 2 * t + 2, "b": b_t_val, "w": 0.0, "prev_decision": 0.0})
@@ -254,7 +238,7 @@ def forward_pald_fast_reuse(models, price_seq, base_seq, flex_seq, Delta_seq,
                 cur_frac = 0.0
             else:
                 x_prev_clamped = max(0.0, min(1.0 - w_eff, float(pseudo_prev_frac)))
-                cur_frac = _solve_base_cvx(base_m, x_prev_clamped, w_eff, p_t_val, y_base, caps_list)
+                cur_frac = _solve_base_cvx(base_m, x_prev_clamped, a_t_val, w_eff, p_t_val, y_base, caps_list)
             cur_phys = float(cur_frac) * b_i
             decisions.append(cur_phys)
             drv["prev_decision"] = float(cur_frac)
@@ -273,7 +257,7 @@ def forward_pald_fast_reuse(models, price_seq, base_seq, flex_seq, Delta_seq,
                 cur_frac = 0.0
             else:
                 x_prev_clamped = max(0.0, min(1.0 - w_eff, float(pseudo_prev_frac)))
-                cur_frac = _solve_flex_purchase_cvx(flex_p_m, x_prev_clamped, w_eff, p_t_val, y_flex_p, caps_list)
+                cur_frac = _solve_flex_purchase_cvx(flex_p_m, x_prev_clamped, a_t_val, w_eff, p_t_val, y_flex_p, caps_list)
             cur_phys = float(cur_frac) * f_i
             decisions.append(cur_phys)
             fd["prev_x"] = float(cur_frac)
@@ -353,14 +337,14 @@ def summarize(values: List[float]) -> Dict[str, float]:
         "max": vs[-1],
     }
 
-def evaluate_many(price_all, base_all, flex_all, Delta_all, p_min, p_max, y_base, y_flex_p, y_flex_d, args, month=None):
+def evaluate_many(price_all, base_all, flex_all, Delta_all, tracking_target_all, p_min, p_max, y_base, y_flex_p, y_flex_d, args, month=None):
     num_instances = len(price_all)
     print(f"Evaluating {num_instances} instances...")
 
     # print details of the current evaluation
     print("trace:", args.trace, "p_min:", p_min, "p_max:", p_max)
 
-    models = _build_models_once(K, gamma, delta)
+    models = _build_models_once(K, gamma, eta, delta)
 
     pald_costs = []
     paad_costs = []
@@ -386,22 +370,34 @@ def evaluate_many(price_all, base_all, flex_all, Delta_all, p_min, p_max, y_base
         b_seq = base_all[idx]
         f_seq = flex_all[idx]
         D_seq = Delta_all[idx]
+        a_seq = tracking_target_all[idx]
 
         # PALD-Fast
         pald_x, pald_z, _ = forward_pald_fast_reuse(
-            models, p_seq, b_seq, f_seq, D_seq,
-            y_base, y_flex_p, y_flex_d, K, gamma, delta, c_delivery, eps_delivery
+            models, p_seq, b_seq, f_seq, D_seq, a_seq, 
+            y_base, y_flex_p, y_flex_d, K, gamma, eta, delta, c_delivery, eps_delivery
         )
-        pald_cost = np_objective_function(T, p_seq, gamma, delta, c_delivery, eps_delivery, pald_x, pald_z)
+        if eta == 0.0:
+            pald_cost = np_objective_function(T, p_seq, gamma, delta, c_delivery, eps_delivery, pald_x, pald_z)
+        else:
+            pald_cost = np_tracking_objective_function(T, p_seq, eta, delta, c_delivery, eps_delivery, pald_x, pald_z, a_seq)
 
         # PAAD
         try:
-            paad_res = pi.paad_algorithm(T, p_seq, gamma, delta,
-                                        c_delivery, eps_delivery,
-                                        p_min, p_max, S, b_seq, f_seq, D_seq)
-            paad_x = paad_res["x"]
-            paad_z = paad_res["z"]
-            paad_cost = np_objective_function(T, p_seq, gamma, delta, c_delivery, eps_delivery, paad_x, paad_z)
+            if eta == 0.0:
+                paad_res = pi.paad_algorithm(T, p_seq, gamma, delta,
+                                            c_delivery, eps_delivery,
+                                            p_min, p_max, S, b_seq, f_seq, D_seq)
+                paad_x = paad_res["x"]
+                paad_z = paad_res["z"]
+                paad_cost = np_objective_function(T, p_seq, gamma, delta, c_delivery, eps_delivery, paad_x, paad_z)
+            else:
+                paad_res = pti.paad_algorithm(T, p_seq, eta, delta,
+                                                    c_delivery, eps_delivery,
+                                                    p_min, p_max, S, b_seq, f_seq, D_seq, a_seq)
+                paad_x = paad_res["x"]
+                paad_z = paad_res["z"]
+                paad_cost = np_tracking_objective_function(T, p_seq, eta, delta, c_delivery, eps_delivery, paad_x, paad_z, a_seq)
         except Exception as e:
             print(f"PAAD failed on instance {idx} with error: {e}")
             continue
@@ -422,13 +418,23 @@ def evaluate_many(price_all, base_all, flex_all, Delta_all, p_min, p_max, y_base
         # OPT (optional)
         if opt_recompute:
             try:
-                status, results = opt_sol.optimal_solution(
-                    T, p_seq, gamma, delta, c_delivery, eps_delivery, S, b_seq, f_seq, D_seq
-                )
+                if eta == 0.0:
+                    status, results = opt_sol.optimal_solution(
+                        T, p_seq, gamma, delta, c_delivery, eps_delivery, S, b_seq, f_seq, D_seq
+                    )
+                else:
+                    status, results = opt_sol.optimal_tracking_solution(
+                        T, p_seq, eta, delta, c_delivery, eps_delivery, S, b_seq, f_seq, D_seq, a_seq
+                    )
                 if status == "Optimal" and results is not None:
-                    oc = np_objective_function(T, p_seq, gamma, delta, c_delivery, eps_delivery,
+                    if eta == 0.0:
+                        oc = np_objective_function(T, p_seq, gamma, delta, c_delivery, eps_delivery,
                                                 results["x"], results["z"])
-                    opt_costs.append(oc)
+                        opt_costs.append(oc)
+                    else:
+                        oc = np_tracking_objective_function(T, p_seq, eta, delta, c_delivery, eps_delivery,
+                                                results["x"], results["z"], a_seq)
+                        opt_costs.append(oc)
                     delivered_opt = float(sum(results["z"]))
                     opt_delivered.append(delivered_opt)
                     row["opt_cost"] = oc
@@ -459,7 +465,7 @@ def evaluate_many(price_all, base_all, flex_all, Delta_all, p_min, p_max, y_base
     return rows
 
 def main():
-    max_month = 12
+    max_month = 1
 
     print(f"Evaluating {args.num_instances} instances (trace={args.trace})...")
     month_data = []
@@ -468,78 +474,74 @@ def main():
         price_all, base_all, flex_all, Delta_all, p_min, p_max = load_scenarios_with_flexible(
             args.num_instances, T, args.trace, month=month, eval=True, scale_factor=40.0, proportion_base=proportion_base
         )
+        tracking_target_all = [[0.0 for _ in seq] for seq in base_all]
         if scale_factor != 40.0:
             # rescale demands by the new scale factor (e.g., if scale factor = 80, divide all demands by 2)
             divisor = scale_factor / 40.0
             base_all = [[b / divisor for b in seq] for seq in base_all]
             flex_all = [[f / divisor for f in seq] for seq in flex_all]
-        month_data.append((price_all, base_all, flex_all, Delta_all, p_min, p_max))
+        if eta != 0.0:
+            for i in range(len(base_all)):
+                # set tracking targets to be the total demand (base + flex) evenly spread over T slots
+                total_demand = sum(base_all[i]) + sum(flex_all[i])
+                even_target = total_demand / T
+                tracking_target_all[i] = [even_target for _ in range(T)]
+                # choose random time slots to have zero target -- probability weighted by the price (higher price, higher chance of zero target)
+                price_seq = np.array(price_all[i])
+                probs = price_seq / np.sum(price_seq)
+                rng = np.random.default_rng(42)
+                # choose a random number of indexes to pick: 2, 3, or 4
+                num_indexes = rng.choice([2, 3, 4])
+                chosen_indexes = rng.choice(int(T), size=num_indexes, replace=False, p=probs)
+                reallocation = 0.0
+                for idx in chosen_indexes:
+                    reallocation += tracking_target_all[i][idx]
+                    tracking_target_all[i][idx] = 0.0
+                # reallocate the removed target evenly to other slots
+                reallocation_per_slot = reallocation / (T - num_indexes)
+                for t in range(T):
+                    if t not in chosen_indexes:
+                        tracking_target_all[i][t] += reallocation_per_slot
+                
+        month_data.append((price_all, base_all, flex_all, Delta_all, tracking_target_all, p_min, p_max))
     
-        if args.analytical:
-            print("Using analytical thresholds.")
-            # Thresholds (analytical) – same for all instances
-            alpha = float(get_alpha(float(p_min), float(p_max), c_delivery, eps_delivery, T, gamma, delta))
-            w_grid = [(i + 0.5) / K for i in range(K)]
-
-            y_base = [base_threshold(w, float(p_min), float(p_max), gamma, delta,
-                                    c_delivery, eps_delivery, T, alpha, b=1.0) for w in w_grid]
-            for i in range(1, K):
-                y_base[i] = min(y_base[i], y_base[i-1])
-            if K > 0:
-                y_base[-1] = float(p_min) + 2.0 * gamma
-
-            y_flex_p = [flex_purchase_threshold(w, float(p_min), float(p_max), gamma, delta,
-                                                c_delivery, eps_delivery, T, alpha, f=1.0) for w in w_grid]
-            for i in range(1, K):
-                y_flex_p[i] = min(y_flex_p[i], y_flex_p[i-1])
-            if K > 0:
-                y_flex_p[-1] = float(p_min) + 2.0 * gamma
-
-            y_flex_d = [flex_delivery_threshold(v, float(p_min), float(p_max), gamma, delta,
-                                                c_delivery, eps_delivery, T, alpha, f=1.0) for v in w_grid]
-            for i in range(1, K):
-                y_flex_d[i] = min(y_flex_d[i], y_flex_d[i-1])
-            if K > 0:
-                y_flex_d[-1] = float(p_min) * (c_delivery + eps_delivery) + 2.0 * delta
-            
-            threshold_data.append((y_base, y_flex_p, y_flex_d))
-        else:
-            print("Using learned thresholds.")
-            prefix = args.thres_file
-            # check if file exists
-            try:
-                # look for file named like best_thresholds_{trace}_{month}_{num_instances}_{timestamp}.pkl
-                candidate = f"best_thresholds_{args.trace}_{month}_{args.num_instances}"
-                # check if any file matches
-                import glob
-                files = glob.glob(f"best_thresholds/{candidate}*")
-                if not files:
-                    print(f"No threshold file matching {candidate} found.")
-                    return
-                # take the first match
-                filename = files[0]
-                print(f"Loading thresholds from {filename}...")
-                with open(filename, "rb") as f:
-                    best_snapshot = pickle.load(f)
-                    y_base = best_snapshot["y_base"]
-                    y_flex_p = best_snapshot["y_flex_purchase"]
-                    y_flex_d = best_snapshot["y_flex_delivery"]
-                    if not (len(y_base) == K and len(y_flex_p) == K and len(y_flex_d) == K):
-                        print(f"Threshold lists in {filename} do not match K={K}.")
-                        return
-                    
-                threshold_data.append((y_base, y_flex_p, y_flex_d))
-            except FileNotFoundError:
-                print(f"Threshold file {filename} not found.")
+      
+        print("Using learned thresholds.")
+        prefix = args.thres_file
+        # check if file exists
+        try:
+            # look for file named like best_thresholds_{trace}_{month}_{num_instances}_{timestamp}.pkl
+            candidate = f"best_thresholds_{args.trace}_{month}_{args.num_instances}"
+            # check if any file matches
+            import glob
+            files = glob.glob(f"best_thresholds/{candidate}*")
+            if not files:
+                print(f"No threshold file matching {candidate} found.")
                 return
+            # take the first match
+            filename = files[0]
+            print(f"Loading thresholds from {filename}...")
+            with open(filename, "rb") as f:
+                best_snapshot = pickle.load(f)
+                y_base = best_snapshot["y_base"]
+                y_flex_p = best_snapshot["y_flex_purchase"]
+                y_flex_d = best_snapshot["y_flex_delivery"]
+                if not (len(y_base) == K and len(y_flex_p) == K and len(y_flex_d) == K):
+                    print(f"Threshold lists in {filename} do not match K={K}.")
+                    return
+                
+            threshold_data.append((y_base, y_flex_p, y_flex_d))
+        except FileNotFoundError:
+            print(f"Threshold file {filename} not found.")
+            return
 
     rows = []
     for month in range(1, max_month + 1):
         print(f"\n--- Evaluating for Month {month} ---")
         # get thresholds for this month
         y_base, y_flex_p, y_flex_d = threshold_data[month - 1]
-        price_all, base_all, flex_all, Delta_all, p_min, p_max = month_data[month - 1]
-        rows_month = evaluate_many(price_all, base_all, flex_all, Delta_all, p_min, p_max, y_base, y_flex_p, y_flex_d, args, month=month)
+        price_all, base_all, flex_all, Delta_all, tracking_target_all, p_min, p_max = month_data[month - 1]
+        rows_month = evaluate_many(price_all, base_all, flex_all, Delta_all, tracking_target_all, p_min, p_max, y_base, y_flex_p, y_flex_d, args, month=month)
         rows.extend(rows_month)
     
     # Aggregates
@@ -569,6 +571,8 @@ def main():
 
     # Save detailed results to a pickle file
     output_file = f'eval_results/{args.trace}_T{args.T}_gamma{args.gamma}_delta{args.delta}_c{args.c_delivery}_eps{args.eps_delivery}_prop{proportion_base}_scale{scale_factor}.pkl'
+    if args.eta > 0.0:
+        output_file = f'eval_results/{args.trace}_T{args.T}_eta{args.eta}_delta{args.delta}_c{args.c_delivery}_eps{args.eps_delivery}_prop{proportion_base}_scale{scale_factor}.pkl'
     os.makedirs('eval_results', exist_ok=True)
     with open(output_file, 'wb') as f:
         pickle.dump(rows, f)
@@ -577,7 +581,6 @@ def main():
     # plot CDF of the ratios
     try:
         import matplotlib.pyplot as plt
-        import numpy as np
 
         def plot_cdf(data, label, color):
             sorted_data = np.sort(data)
