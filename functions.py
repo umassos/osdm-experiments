@@ -175,6 +175,11 @@ def load_scenarios_with_flexible_context(num_scenarios, T, trace_name, proportio
     Delta_scenarios = []
 
     signal, forecasts, datetimes, p_min, p_max = load_signal_trace_with_context(trace_name, month=month)
+    
+    # print the signal, forecasts, datetimes
+    # print(f"Signal: {signal}")
+    # print(f"Forecasts: {forecasts}")
+    # print(f"Datetimes: {datetimes}")
 
     # if we don't already have scenarios pickled for this configuration, generate them
     # first check for a pickled file in demand_traces

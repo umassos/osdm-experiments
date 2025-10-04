@@ -8,7 +8,8 @@ from pald_implementation import (
     make_pald_base_layer,
     make_pald_flex_purchase_layer,
     make_pald_flex_delivery_layer,
-    compute_segment_caps,
+    torch_objective,
+    hinge_from_y_torch
 )
 from contextual_model import ThresholdPredictor
 import paad_implementation as pi
@@ -52,36 +53,33 @@ run_tag = run_start_dt.strftime("%m%d%H%M")
 print(f"[run] Start time: {run_start_str} (tag={run_tag})")
 run_generated_files: list[str] = []
 
-solver_options = {
-    # SCS-like settings often work best for differentiable layers
-    "eps": 1e-5,
-    "max_iters": 2000,
-    "verbose": False,
-}
+# solver_options = { "solve_method": "ECOS", "abstol": 1e-5, "reltol": 1e-5, "feastol": 1e-5 }
+solver_options = {}
 
 parser = argparse.ArgumentParser(description="Train PALD with flexible demand and deadlines.")
-parser.add_argument('--batch_size', type=int, default=4, help='Batch size for training (default: 4 for debugging)')
+parser.add_argument('--batch_size', type=int, default=4, help='Batch size for training (default: 4)')
 parser.add_argument('--num_batches', type=int, default=1, help='Number of batches per epoch (default: 1)')
 parser.add_argument('--use_cost_loss', action='store_true', help='Use total cost loss instead of competitive-ratio loss')
 parser.add_argument('--trace', type=str, default="CAISO", help='Trace name to use (default: CAISO)')
 parser.add_argument('--month', type=int, default=99, help='Month to filter for in trace (default: 1, 99 for all)')
-parser.add_argument('--warmup_epochs', type=int, default=50, help='Supervised warm-up epochs to aligning y0 to OPT/quantile targets')
-parser.add_argument('--warmup_lambda', type=float, default=5.0, help='Weight of warm-up y0 loss during warm-up phase')
+parser.add_argument('--warmup_epochs', type=int, default=100, help='Supervised warm-up epochs to align y0 to OPT/quantile targets')
+parser.add_argument('--warmup_lambda', type=float, default=1000.0, help='Weight of warm-up y0 loss during warm-up phase')
 parser.add_argument('--y0_margin', type=float, default=10.0, help='Margin to add to OPT avg price for base/flex purchase y0 target')
-parser.add_argument('--post_warmup_epochs', type=int, default=50, help='Number of epochs to decay anchor after warm-up')
+parser.add_argument('--post_warmup_epochs', type=int, default=0, help='Number of epochs to decay anchor after warm-up')
 parser.add_argument('--post_warmup_lambda', type=float, default=1.0, help='Initial weight of post-warmup anchor (decays to 0)')
-parser.add_argument('--freeze_trunk_epochs', type=int, default=20, help='Freeze trunk for these epochs after warm-up to avoid collapse')
+parser.add_argument('--freeze_trunk_epochs', type=int, default=0, help='Freeze trunk for these epochs after warm-up to avoid collapse')
 parser.add_argument('--topup_penalty_lambda', type=float, default=20.0, help='Weight for penalizing reliance on forced top-ups')
 args = parser.parse_args()
 
 K = 10           # number of segments in piecewise linear approximation for psi
+taus_full_t = torch.linspace(0.0, 1.0, 11, dtype=torch.float32)
 gamma = 10.0     # switching cost parameter for x
 delta = 5.0     # switching cost parameter for z (used in analytical threshold)
 S = 1.0          # maximum inventory capacity
 T = 48          # 12 hours in 15-minute intervals
 c_delivery = 0.2
 eps_delivery = 0.05
-epochs = 500
+epochs = 1000
 # get batch size from command line 
 batch_size = args.batch_size
 # get number of batches from command line
@@ -167,11 +165,11 @@ for i in range(total_instances):
     flexp_y0_targets.append(tgt)
     flexd_y0_targets.append(tgt*(c_delivery + eps_delivery))  # flex delivery y0 target scaled
 
-## Contextual thresholds model (MonotoneHead with softplus cumulative form)
+# random_base_targets, random_flexp_targets, random_flexd_targets = 
 
 # Instantiate contextual model
 feature_dim = 11  # handcrafted features length (see build_driver_features)
-model = ThresholdPredictor(input_dim=feature_dim, K=K, hidden_dims=(128, 128))
+model = ThresholdPredictor(input_dim=feature_dim, K=K+1, hidden_dims=(64, 64))
 model_device = torch.device("cpu")
 model.to(model_device)
 model.train()
@@ -238,9 +236,9 @@ def build_driver_features(t_idx: int,
     return torch.tensor(feats, dtype=torch.float32, device=model_device)
 
 ## CVX layers (base, flex purchase, flex delivery)
-pald_base_layer = make_pald_base_layer(K, gamma, ridge=False)
-pald_flex_purchase_layer = make_pald_flex_purchase_layer(K, gamma, ridge=False)
-pald_flex_delivery_layer = make_pald_flex_delivery_layer(K, delta, c_delivery, eps_delivery, ridge=False)
+pald_base_layer = make_pald_base_layer(K)
+pald_flex_purchase_layer = make_pald_flex_purchase_layer(K)
+pald_flex_delivery_layer = make_pald_flex_delivery_layer(K)
 
 # Optimizer
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -254,38 +252,18 @@ best_snapshot = {
     "model_state": None,
 }
 
-
-## Differentiable PALD objective in torch (matches paad_implementation.objective_function)
-def torch_objective(p_seq, x_seq, z_seq, gamma, delta, c, eps):
-    """Torch version of objective_function for differentiable PALD cost.
-    Inputs are torch 1D tensors of length T (float32).
-    Mirrors paad_implementation.objective_function.
+def _safe_layer_call(layer, y, args, size=1.0):
     """
-    Tn = p_seq.shape[0]
-    # state of charge s[0..T]
-    s = []
-    s_prev = torch.tensor(0.0, dtype=torch.float32)
-    s.append(s_prev)
-    for t in range(1, Tn+1):
-        s_t = torch.maximum(s_prev + x_seq[t-1] - z_seq[t-1], torch.tensor(0.0))
-        s.append(s_t)
-        s_prev = s_t
-    s_torch = torch.stack(s)  # s[0..T-1] corresponds to s_1..s_T in numpy version
-
-    # Costs
-    cost_purchasing = (p_seq * x_seq).sum()
-    switching_cost_x = gamma * (x_seq[1:] - x_seq[:-1]).abs().sum() if Tn > 1 else torch.tensor(0.0)
-    switching_cost_z = delta * (z_seq[1:] - z_seq[:-1]).abs().sum() if Tn > 1 else torch.tensor(0.0)
-    # s_{t-1} sequence for discharge term
-    s_prev_seq = torch.cat([s_torch[:-1]])
-    discharge_cost = (p_seq * (c * z_seq + eps * z_seq - c * s_prev_seq * z_seq)).sum()
-    return cost_purchasing + switching_cost_x + switching_cost_z + discharge_cost
-
-
-def _safe_layer_call(layer, args, size=1.0):
-    """Call a CvxpyLayer and unwrap its single-output tensor."""
-    (val,) = layer(*args, solver_args=solver_options)
-    return val
+    Call a CvxpyLayer and catch SCS/diffcp failures. Returns x_total tensor.
+    """
+    try:
+        (x_total,) = layer(*args, solver_args=solver_options)
+        return x_total
+    except Exception as e:
+        print(f"[warning] CvxpyLayer call failed: {e}")
+        print("Current y:", [float(v) for v in y.detach().cpu().reshape(-1)])
+        print("Current args:", args)
+        exit(1)
 
 
 def _group_model_params_by_name(model: ThresholdPredictor) -> Dict[str, List[Tuple[str, torch.nn.Parameter]]]:
@@ -418,26 +396,28 @@ try:
         clip_events = 0
         # Track last computed loss this epoch (last batch)
         last_epoch_loss = float('nan')
-        # Enable/disable parameter groups depending on warm-up
+
+        # Enable/disable parameter groups depending on warm-up (only the boolean; per-param freezing remains off)
         warmup_active = epoch < int(args.warmup_epochs)
-        if warmup_active:
-            # Freeze everything except the top gate biases/weights to shape y0
-            for name, p in model.named_parameters():
-                if any(k in name for k in ["_head_top.weight", "_head_top.bias"]):
-                    p.requires_grad_(True)
-                else:
-                    p.requires_grad_(False)
-        else:
-            # Immediately after warm-up, freeze trunk for a few epochs to stabilize heads
-            post_warm = epoch - int(args.warmup_epochs)
-            for name, p in model.named_parameters():
-                if post_warm >= 0 and post_warm < int(args.freeze_trunk_epochs):
-                    if any(k in name for k in ["trunk."]):
-                        p.requires_grad_(False)
-                    else:
-                        p.requires_grad_(True)
-                else:
-                    p.requires_grad_(True)
+        # if warmup_active:
+        #     # Freeze everything except the top gate biases/weights to shape y0
+        #     for name, p in model.named_parameters():
+        #         if any(k in name for k in ["_head_top.weight", "_head_top.bias"]):
+        #             p.requires_grad_(True)
+        #         else:
+        #             p.requires_grad_(False)
+        # else:
+        #     # Immediately after warm-up, freeze trunk for a few epochs to stabilize heads
+        #     post_warm = epoch - int(args.warmup_epochs)
+        #     for name, p in model.named_parameters():
+        #         if post_warm >= 0 and post_warm < int(args.freeze_trunk_epochs):
+        #             if any(k in name for k in ["trunk."]):
+        #                 p.requires_grad_(False)
+        #             else:
+        #                 p.requires_grad_(True)
+        #         else:
+        #             p.requires_grad_(True)
+
         # Diagnostics accumulators per epoch
         epoch_base_calls = 0
         epoch_base_active = 0
@@ -467,6 +447,7 @@ try:
             Delta_batch = Delta_all[start:end]
             batch_total_loss = torch.tensor(0.0)
             warmup_loss_sum = torch.tensor(0.0)
+
             batch_crs = []  # competitive ratios for this batch
             # Iterate instances in this batch
             for idx, (price_seq, time_seq, month_seq, forecast_seq, base_seq, flex_seq, Delta_seq) in enumerate(zip(price_batch, time_batch, month_batch, forecast_batch, base_batch, flex_batch, Delta_batch)):
@@ -486,7 +467,7 @@ try:
                     pass
                 epoch_inst_count += 1
                 # global storage state and decision both start at 0
-                storage_state = 0.0
+                storage_state = torch.tensor(0.0, dtype=torch.float32)
                 x_prev_global = torch.tensor(0.0)
 
                 # Each base driver tracks fractional progress (unit capacity); demand scales the fractional decision
@@ -498,7 +479,15 @@ try:
                     kind="base", b_or_f=S, delta_idx=T, p_min=float(p_min), p_max=float(p_max)
                 )
                 y_vec_t, _, _ = model(feats, p_min=float(p_min), p_max=float(p_max))
-                base_drivers.append({"id": 0, "b": S, "w": 0.0, "prev_decision": 0.0, "y_vec": y_vec_t})
+                # log y_vec_t to the console
+                # print(f"[debug] Initial base y_vec: {[float(v) for v in y_vec_t.detach().cpu()]}")
+                base_drivers.append({
+                    "id": 0,
+                    "b": S,
+                    "w": torch.tensor(0.0, dtype=torch.float32).reshape(-1),
+                    "prev_decision": torch.tensor(0.0, dtype=torch.float32).reshape(-1),
+                    "y_vec": y_vec_t,
+                })
                 # Flexible drivers: track purchase (w) and delivery (v) progress fractions
                 flex_drivers = []  # dict keys: id, f, delta, w, v, prev_x, prev_z
 
@@ -520,7 +509,12 @@ try:
                             kind="flex", b_or_f=f_arrival, delta_idx=dlt, p_min=float(p_min), p_max=float(p_max)
                         )
                         _, y_vec_p, y_vec_d = model(feats, p_min=float(p_min), p_max=float(p_max))
-                        flex_drivers.append({"id": 2 * t + 1, "f": f_arrival, "delta": dlt, "w": 0.0, "v": 0.0, "prev_x": 0.0, "prev_z": 0.0, "y_vec_purchase": y_vec_p, "y_vec_delivery": y_vec_d})
+                        flex_drivers.append({"id": 2 * t + 1, "f": f_arrival, "delta": dlt, 
+                                             "w": torch.tensor(0.0, dtype=torch.float32).reshape(-1), 
+                                             "v": torch.tensor(0.0, dtype=torch.float32).reshape(-1), 
+                                             "prev_x": torch.tensor(0.0, dtype=torch.float32).reshape(-1), 
+                                             "prev_z": torch.tensor(0.0, dtype=torch.float32).reshape(-1), 
+                                             "y_vec_purchase": y_vec_p, "y_vec_delivery": y_vec_d})
 
                     # Add base driver if non-zero
                     if b_t_val > 0:
@@ -534,7 +528,9 @@ try:
                                 kind="base", b_or_f=S, delta_idx=T, p_min=float(p_min), p_max=float(p_max)
                             )
                             y_vec_t, _, _ = model(feats, p_min=float(p_min), p_max=float(p_max))
-                            base_drivers.append({"id": 0, "b": S, "w": 0.0, "prev_decision": 0.0, "y_vec": y_vec_t})
+                            base_drivers.append({"id": 0, "b": S, 
+                                                 "w": torch.tensor(0.0, dtype=torch.float32).reshape(-1), 
+                                                 "prev_decision": torch.tensor(0.0, dtype=torch.float32).reshape(-1), "y_vec": y_vec_t})
                         else:
                             # Predict threshold for this base driver
                             feats = build_driver_features(
@@ -543,20 +539,23 @@ try:
                                 kind="base", b_or_f=b_t_val, delta_idx=T, p_min=float(p_min), p_max=float(p_max)
                             )
                             y_vec_t, _, _ = model(feats, p_min=float(p_min), p_max=float(p_max))
-                            base_drivers.append({"id": 2 * t + 2, "b": b_t_val, "w": 0.0, "prev_decision": 0.0, "y_vec": y_vec_t})
+                            base_drivers.append({"id": 2 * t + 2, "b": b_t_val, 
+                                                 "w": torch.tensor(0.0, dtype=torch.float32).reshape(-1), 
+                                                 "prev_decision": torch.tensor(0.0, dtype=torch.float32).reshape(-1), "y_vec": y_vec_t})
 
                     # Compute purchasing excess from previous step in physical units
-                    prev_purchasing_total = 0.0
+                    prev_purchasing_total = torch.tensor(0.0, dtype=torch.float32)
                     for drv in base_drivers:
-                        prev_purchasing_total += drv["prev_decision"] * drv["b"]
+                        prev_purchasing_total = prev_purchasing_total + (drv["prev_decision"] * drv["b"])  # tensor
                     for fd in flex_drivers:
-                        prev_purchasing_total += fd["prev_x"] * fd["f"]
-                    purchasing_excess = x_prev_global.item() - prev_purchasing_total
+                        prev_purchasing_total = prev_purchasing_total + (fd["prev_x"] * fd["f"])  # tensor
+                    # Keep x_prev_global as tensor for gradient flow across time
+                    purchasing_excess = x_prev_global - prev_purchasing_total
 
                     # Compute delivery excess from previous step in physical units
-                    prev_delivery_total = 0.0
+                    prev_delivery_total = torch.tensor(0.0, dtype=torch.float32)
                     for fd in flex_drivers:
-                        prev_delivery_total += fd["prev_z"] * fd["f"]
+                        prev_delivery_total = prev_delivery_total + (fd["prev_z"] * fd["f"])  # tensor
                     # last z was base b_{t-1} + flex deliveries; but we only need per-driver shares here
 
                     # compute the cumulative upper bound on the buying decision at the current time step:
@@ -565,7 +564,7 @@ try:
                     # first determine the flex deliveries
 
                     # Base delivery equals current base demand arrival
-                    z_components = [torch.tensor(b_t_val, dtype=torch.float32)]
+                    z_components = [torch.tensor(b_t_val, dtype=torch.float32).reshape(-1)]
 
                     # Flexible drivers: delivery decisions
                     for fd in flex_drivers:
@@ -574,63 +573,72 @@ try:
                         y_vec_d = fd["y_vec_delivery"]
                         # share positive excess proportional to previous physical contribution
                         # share delivery excess (if you track it globally); here we just use prev_frac_z
-                        v_prev_frac = float(fd["v"])
-                        w_prev_frac = float(fd["w"])
+                        v_prev_frac = fd["v"]
+                        w_prev_frac = fd["w"]
 
                         # Enforce deadline and purchase cap outside the layer (keeps DPP)
-                        if t >= max(0, int(fd["delta"]) - 1):
-
-                            cur_frac_z = torch.tensor(max(0.0, 1.0 - v_prev_frac), dtype=torch.float32)
+                        if t >= max(0, int(fd["delta"])):
+                            # need to deliver remainder
+                            cur_frac_z = torch.clamp(1.0 - v_prev_frac, min=0.0).reshape(-1)
+                            z_components.append(cur_frac_z)
+                            fd["prev_z"] = cur_frac_z.reshape(-1)
+                            fd["v"] = (fd["v"] + cur_frac_z).reshape(-1)
+                            continue
+                        # if w is really low, just force a zero decision
+                        if float(w_prev_frac.detach().item()) <= 1e-9:
+                            # no more buying possible, force zero decision
+                            cur_frac_z = torch.tensor(0.0, dtype=torch.float32).reshape(-1)
+                            z_components.append(cur_frac_z)
+                            fd["prev_z"] = cur_frac_z.reshape(-1)
+                            fd["v"] = (fd["v"] + cur_frac_z).reshape(-1)
+                            continue
                         else:
-                            caps_list = compute_segment_caps(v_prev_frac, K)
-                            v_eff = max(0.0, min(1.0 - 1e-9, v_prev_frac))
-                            caps_list = compute_segment_caps(v_eff, K)
-                            if (1.0 - v_eff) <= 1e-9 or sum(caps_list) <= 1e-12:
-                                cur_frac_z = torch.tensor(0.0, dtype=torch.float32)
-                                cur_frac_z = torch.clamp(cur_frac_z, max=max(0.0, w_prev_frac - v_prev_frac))
-                                cur_phys_z = torch.mul(cur_frac_z, f_i)
-                                z_components.append(cur_phys_z)
-                                fd["prev_z"] = float(cur_frac_z.detach())
-                                fd["v"] = float(min(1.0, fd["v"] + fd["prev_z"]))
+                            # clamp v into [0, 1 - eps] to avoid issues with the solver
+                            v_eff = torch.clamp(v_prev_frac, max=1.0 - 1e-9)
+                            if (1.0 - float(v_eff.detach().item())) <= 1e-9:
+                                cur_frac_z = torch.tensor(0.0, dtype=torch.float32).reshape(-1)
+                                cur_frac_z = torch.clamp(cur_frac_z, max=max(0.0, w_prev_frac - v_prev_frac)).reshape(-1)
+                                z_components.append(cur_frac_z)
+                                fd["prev_z"] = cur_frac_z
+                                fd["v"] = (fd["v"] + cur_frac_z).reshape(-1)
                                 continue
-                            z_prev_clamped = max(0.0, min(1.0 - v_eff, float(fd["prev_z"])))
+                            # z_prev_clamped = torch.clamp(prev_frac_z, max=1.0 - 1e-9)
                             y_vec_d = fd["y_vec_delivery"]
-                            z_prev_frac_t = torch.tensor(z_prev_clamped, dtype=torch.float32)
-                            v_prev_frac_t = torch.tensor(v_eff, dtype=torch.float32)
-                            p_t_t = torch.tensor(p_t_val, dtype=torch.float32)
-                            s_prev_t = torch.tensor(float(max(0.0, storage_state)), dtype=torch.float32)
-                            caps_t = torch.tensor(caps_list, dtype=torch.float32)
+                            p_t_t = torch.tensor([p_t_val], dtype=torch.float32)
+                            delta_t = torch.tensor(delta, dtype=torch.float32).reshape(-1)
 
                             # Precompute coeff = p_t * (c+eps) - p_t * c * s_prev  (scalar)
-                            coeff_t = torch.tensor(
-                                p_t_val * ((c_delivery + eps_delivery) - c_delivery * float(max(0.0, storage_state))),
-                                dtype=torch.float32,
-                            )
+                            coeff_t = p_t_t * (torch.tensor(c_delivery + eps_delivery) - torch.tensor(c_delivery) * storage_state)
+                                                            
+                            # precompute hinge
+                            w_hinge_t, c1_t = hinge_from_y_torch(taus_full_t, y_vec_d)
 
                             cur_frac_z = _safe_layer_call(
-                                pald_flex_delivery_layer, (z_prev_frac_t, v_prev_frac_t, coeff_t, y_vec_d, caps_t), size=(1.0 - v_eff)
+                                pald_flex_delivery_layer, y_vec_d, (fd["prev_z"], v_eff, coeff_t, delta_t, w_hinge_t, c1_t)
                             )
-                        cur_phys_z = torch.mul(cur_frac_z, f_i)
+                        cur_phys_z = torch.mul(cur_frac_z, f_i).reshape(-1)
                         z_components.append(cur_phys_z)
-                        fd["prev_z"] = float(cur_frac_z.detach())
-                        fd["v"] = float(min(1.0, fd["v"] + fd["prev_z"]))
+
+                        # Update state for the next step (kept differentiable)
+                        fd["prev_z"] = cur_frac_z.reshape(-1)
+                        fd["v"] = (fd["v"] + cur_frac_z).reshape(-1)
 
                     z_t = torch.stack(z_components).sum()
-                    storage_torch = torch.tensor(storage_state, dtype=torch.float32)
 
                     # now that we have the delivery z_t, we can compute the buy cap
-                    buy_cap = float(S) - storage_state + float(z_t.detach())
+                    buy_cap_t = torch.tensor(S, dtype=torch.float32) - storage_state + z_t
+                    # buy_cap_t = torch.tensor(buy_cap, dtype=torch.float32)
                     # we will decrement from this buy_cap as we allocate to drivers below
 
                     # Determine per-driver decisions (fractional)
                     decisions = []  # list of tensors in physical units
                     for drv in base_drivers:
-                        if buy_cap <= 1e-9:
+                        if float(buy_cap_t.detach().item()) <= 1e-9:
                             # no more buying possible, force zero decision
-                            cur_phys_decision = torch.tensor(0.0, dtype=torch.float32)
+                            cur_phys_decision = torch.tensor(0.0, dtype=torch.float32).reshape(-1)
                             decisions.append(cur_phys_decision)
-                            drv["prev_decision"] = float(cur_phys_decision.detach())
-                            drv["w"] = float(min(1.0, drv["w"] + drv["prev_decision"]))
+                            drv["prev_decision"] = cur_phys_decision
+                            drv["w"] = (drv["w"] + drv["prev_decision"]).reshape(-1)
                             continue
 
                         b_i = drv["b"]
@@ -638,150 +646,172 @@ try:
                         y_vec_t = drv["y_vec"]
 
                         # share positive excess proportional to previous physical contribution
-                        denom = prev_purchasing_total if prev_purchasing_total > 0 else 1.0
-                        share = (prev_frac * b_i) / denom if prev_purchasing_total > 0 else 0.0
-                        pseudo_prev_frac = prev_frac + max(0.0, purchasing_excess) * share / max(b_i, 1e-8)
+                        # Compute share and pseudo previous fraction with tensor ops (keeps autograd)
+                        denom_safe = torch.clamp(prev_purchasing_total, min=1e-8)
+                        share = torch.where(prev_purchasing_total > 1e-12,
+                                            (prev_frac * b_i) / denom_safe,
+                                            torch.tensor(0.0, dtype=torch.float32))
+                        positive_excess = torch.clamp(purchasing_excess, min=0.0)
+                        pseudo_prev_frac = prev_frac + positive_excess * share / max(b_i, 1e-8)
 
-                        # Compute per-segment caps for current cumulative fraction w
-                        w_prev_frac = float(drv["w"])
+                        w_prev_frac = drv["w"]
                         # Clamp w into [0, 1 - eps] to avoid issues with the solver
-                        w_eff = max(0.0, min(1.0 - 1e-9, w_prev_frac))
-                        caps_list = compute_segment_caps(w_eff, K)
-                        if (1.0 - w_eff) <= 1e-9 or sum(caps_list) <= 1e-12:
-                            cur_frac_decision = torch.tensor(0.0, dtype=torch.float32)
-                            cur_phys_decision = torch.mul(cur_frac_decision, b_i)
-                            decisions.append(cur_phys_decision)
-                            drv["prev_decision"] = float(cur_frac_decision.detach())
-                            drv["w"] = float(min(1.0, drv["w"] + drv["prev_decision"]))
+                        w_eff = torch.clamp(w_prev_frac, max=1.0 - 1e-9)
+                        if (1.0 - float(w_eff.detach().item())) <= 1e-9:
+                            cur_frac_decision = torch.tensor(0.0, dtype=torch.float32).reshape(-1)
+                            decisions.append(cur_frac_decision)
+                            drv["prev_decision"] = cur_frac_decision
+                            drv["w"] = (drv["w"] + drv["prev_decision"]).reshape(-1)
                             continue
 
-                        x_prev_frac_t = torch.tensor(float(pseudo_prev_frac), dtype=torch.float32)
-                        w_prev_frac_t = torch.tensor(w_eff, dtype=torch.float32)
-                        p_t_t = torch.tensor(p_t_val, dtype=torch.float32)
-                        caps_t = torch.tensor(caps_list, dtype=torch.float32)
+                        # === forward ===
+                        w_hinge_t, c1_t = hinge_from_y_torch(taus_full_t, y_vec_t)
+
+                        gamma_t = torch.tensor(gamma, dtype=torch.float32).reshape(-1)
+                        p_t_t = torch.tensor([p_t_val], dtype=torch.float32)
 
                         cur_frac_decision = _safe_layer_call(
-                            pald_base_layer, (x_prev_frac_t, w_prev_frac_t, p_t_t, y_vec_t, caps_t), size=(1.0 - w_eff)
+                            pald_base_layer, y_vec_t, (pseudo_prev_frac, w_eff, p_t_t, gamma_t, w_hinge_t, c1_t)
                         )
+
                         # diagnostics: base activation
                         epoch_base_calls += 1
                         if float(cur_frac_decision.detach().item()) > 1e-9:
                             epoch_base_active += 1
 
                         # Convert to physical units by scaling with demand of this driver
-                        cur_phys_decision = torch.mul(cur_frac_decision, b_i)
+                        cur_phys_decision = torch.mul(cur_frac_decision, b_i).reshape(-1)
 
-                        # check if this decision exceeds the remaining buy cap
-                        if float(cur_phys_decision.detach()) > buy_cap + 1e-5:
+                        # check if this decision exceeds the remaining buy cap (use scalar check for control flow)
+                        if float((cur_phys_decision - buy_cap_t).detach().item()) > 1e-5:
                             # take the remaining buy cap instead
-                            cur_phys_decision = torch.tensor(buy_cap, dtype=torch.float32)
+                            cur_phys_decision = (buy_cap_t.to(torch.float32)).reshape(-1)
                             # and set the fractional decision accordingly
                             if b_i > 1e-8:
                                 cur_frac_decision = cur_phys_decision / b_i
                             else:
-                                cur_frac_decision = torch.tensor(0.0, dtype=torch.float32)
+                                cur_frac_decision = torch.tensor(0.0, dtype=torch.float32).reshape(-1)
                             # after this, the buy cap is zero
-                            buy_cap = 0.0
+                            buy_cap_t = torch.tensor(0.0, dtype=torch.float32)
 
                         decisions.append(cur_phys_decision)
-                        buy_cap -= float(cur_phys_decision.detach())
+                        buy_cap_t = buy_cap_t - cur_phys_decision
 
-                        # Update driver internal state (detach to avoid history growth)
-                        drv["prev_decision"] = float(cur_frac_decision.detach())
-                        drv["w"] = float(min(1.0, drv["w"] + drv["prev_decision"]))
+                        # Update state for the next step (kept differentiable)
+                        drv["w"] = (drv["w"] + cur_frac_decision).reshape(-1)
+                        drv["prev_decision"] = (cur_frac_decision).reshape(-1)
 
                     # Flexible drivers: purchasing decisions
                     for fd in flex_drivers:
-                        if buy_cap <= 1e-9:
+                        if float(buy_cap_t.detach().item()) <= 1e-9:
                             # no more buying possible, force zero decision
-                            cur_phys_x = torch.tensor(0.0, dtype=torch.float32)
+                            cur_phys_x = torch.tensor(0.0, dtype=torch.float32).reshape(-1)
                             decisions.append(cur_phys_x)
-                            fd["prev_x"] = float(cur_phys_x.detach())
-                            fd["w"] = float(min(1.0, fd["w"] + fd["prev_x"]))
+                            fd["prev_x"] = cur_phys_x
+                            fd["w"] = (fd["w"] + fd["prev_x"]).reshape(-1)
                             continue
 
                         f_i = fd["f"]
                         prev_frac_x = fd["prev_x"]
                         y_vec_t = fd["y_vec_purchase"]
 
-                        denom = prev_purchasing_total if prev_purchasing_total > 0 else 1.0
-                        share = (prev_frac_x * f_i) / denom if prev_purchasing_total > 0 else 0.0
-                        pseudo_prev_x = prev_frac_x + max(0.0, purchasing_excess) * share / max(f_i, 1e-8)
+                        denom_safe = torch.clamp(prev_purchasing_total, min=1e-8)
+                        share = torch.where(prev_purchasing_total > 1e-12,
+                                            (prev_frac_x * f_i) / denom_safe,
+                                            torch.tensor(0.0, dtype=torch.float32))
+                        positive_excess = torch.clamp(purchasing_excess, min=0.0)
+                        pseudo_prev_x = prev_frac_x + positive_excess * share / max(f_i, 1e-8)
 
-                        w_prev_frac = float(fd["w"])
-                        w_eff = max(0.0, min(1.0 - 1e-9, w_prev_frac))
+                        w_prev_frac = fd["w"]
+                        # Clamp w into [0, 1 - eps] to avoid issues with the solver
+                        w_eff = torch.clamp(w_prev_frac, max=1.0 - 1e-9)
+                        if (1.0 - float(w_eff.detach().item())) <= 1e-9:
+                            cur_frac_x = torch.tensor(0.0, dtype=torch.float32).reshape(-1)
+                            decisions.append(cur_frac_x)
+                            fd["prev_x"] = cur_frac_x
+                            fd["w"] = (fd["w"] + fd["prev_x"]).reshape(-1)
+                            continue
 
                         # Enforce deadline and purchase cap outside the layer (keeps DPP)
-                        if t >= max(0, int(fd["delta"]) - 1):
-                            cur_frac_x = torch.tensor(max(0.0, 1.0 - w_prev_frac), dtype=torch.float32)
+                        if t >= max(0, int(fd["delta"])):
+                            # need to buy remainder
+                            cur_frac_x = torch.clamp(1.0 - w_prev_frac, min=0.0).reshape(-1)
+                            decisions.append(cur_frac_x)
+                            fd["prev_x"] = cur_frac_x
+                            fd["w"] = (fd["w"] + fd["prev_x"]).reshape(-1)
+                            cur_phys_x = torch.mul(cur_frac_x, f_i).reshape(-1)
+                            buy_cap_t = buy_cap_t - cur_phys_x
+                            continue
                         else:
-                            caps_list = compute_segment_caps(w_eff, K)
-                            if (1.0 - w_eff) <= 1e-9 or sum(caps_list) <= 1e-12:
-                                cur_frac_x = torch.tensor(0.0, dtype=torch.float32)
-                                cur_phys_x = torch.mul(cur_frac_x, f_i)
-                                decisions.append(cur_phys_x)
-                                fd["prev_x"] = float(cur_frac_x.detach())
-                                fd["w"] = float(min(1.0, fd["w"] + fd["prev_x"]))
-                                continue
-                            x_prev_clamped = max(0.0, min(1.0 - w_eff, float(pseudo_prev_x)))
-                            x_prev_frac_t = torch.tensor(x_prev_clamped, dtype=torch.float32)
-                            w_prev_frac_t = torch.tensor(w_eff, dtype=torch.float32)
-                            p_t_t = torch.tensor(p_t_val, dtype=torch.float32)
-                            caps_t = torch.tensor(caps_list, dtype=torch.float32)
+                            # x_prev_clamped = max(0.0, min(1.0 - w_eff, float(pseudo_prev_x)))
+
+                            # === forward ===
+                            w_hinge_t, c1_t = hinge_from_y_torch(taus_full_t, y_vec_t)
+
+                            gamma_t = torch.tensor(gamma, dtype=torch.float32).reshape(-1)
+                            p_t_t = torch.tensor([p_t_val], dtype=torch.float32)
 
                             cur_frac_x = _safe_layer_call(
-                                pald_flex_purchase_layer, (x_prev_frac_t, w_prev_frac_t, p_t_t, y_vec_t, caps_t), size=(1.0 - w_eff)
+                                pald_flex_purchase_layer, y_vec_t, (pseudo_prev_x, w_eff, p_t_t, gamma_t, w_hinge_t, c1_t)
                             )
                         # diagnostics: flex purchase activation
                         epoch_flex_calls += 1
                         if float(cur_frac_x.detach().item()) > 1e-9:
                             epoch_flex_active += 1
                         
-                        cur_phys_x = torch.mul(cur_frac_x, f_i)
+                        cur_phys_x = torch.mul(cur_frac_x, f_i).reshape(-1)
 
                         # check if this decision exceeds the remaining buy cap
-                        if float(cur_phys_x.detach()) > buy_cap + 1e-5:
+                        if float((cur_phys_x - buy_cap_t).detach().item()) > 1e-5:
                             # take the remaining buy cap instead
-                            cur_phys_x = torch.tensor(buy_cap, dtype=torch.float32)
+                            cur_phys_x = (buy_cap_t.to(torch.float32)).reshape(-1)
                             # and set the fractional decision accordingly
                             if f_i > 1e-8:
                                 cur_frac_x = cur_phys_x / f_i
                             else:
-                                cur_frac_x = torch.tensor(0.0, dtype=torch.float32)
+                                cur_frac_x = torch.tensor(0.0, dtype=torch.float32).reshape(-1)
                             # after this, the buy cap is zero
-                            buy_cap = 0.0
+                            buy_cap_t = torch.tensor(0.0, dtype=torch.float32)
                         
                         decisions.append(cur_phys_x)
-                        buy_cap -= float(cur_phys_x.detach())
+                        buy_cap_t = buy_cap_t - cur_phys_x
 
-                        fd["prev_x"] = float(cur_frac_x.detach())
-                        fd["w"] = float(min(1.0, fd["w"] + fd["prev_x"]))
+                        # Update state for the next step (kept differentiable)
+                        fd["w"] = (fd["w"] + cur_frac_x).reshape(-1)
+                        fd["prev_x"] = (cur_frac_x).reshape(-1)
 
                     # Aggregate physical purchases this step
+                    # print decisions to debug any differences in shape
                     x_t = torch.stack(decisions).sum() if decisions else torch.tensor(0.0)
+
                     # Diagnostics: forced top-up outside CVX layers
                     x_pre_val = float(x_t.detach().item())
                     
                     # Ensure purchases cover deliveries (inventory feasibility)
-                    required = torch.maximum(z_t - storage_torch, torch.tensor(0.0))
-                    forced_extra = torch.maximum(required - torch.tensor(x_pre_val, dtype=torch.float32), torch.tensor(0.0))
+                    # storage_state is maintained as a torch scalar throughout
+                    required = torch.maximum(z_t - storage_state, torch.tensor(0.0, dtype=z_t.dtype))
+                    forced_extra = torch.maximum(required - torch.tensor(x_pre_val, dtype=torch.float32), torch.tensor(0.0, dtype=z_t.dtype))
                     if forced_extra > 1e-9:
                         epoch_forced_topup_sum += forced_extra.item()
                         epoch_forced_topup_events += 1
                     epoch_xpre_count += 1
                     if x_pre_val <= 1e-9:
                         epoch_xpre_zero += 1
-                    x_t = torch.maximum(x_t, z_t - torch.tensor(storage_state, dtype=x_t.dtype))
+                    x_t = torch.maximum(x_t, z_t - storage_state)
 
                     # diagnostics -- check if the currect decision will ``overfill the storage''
-                    if float(storage_state + float(x_t.detach()) - float(z_t.detach())) > S + 1e-3:
+                    if float(storage_state.detach().item() + x_t.detach().item() - z_t.detach().item()) > S + 1e-3:
                         print(f"[warning] t={t} overfill: storage {storage_state:.3f} + x {float(x_t.detach()):.3f} - z {float(z_t.detach()):.3f} > S={S}")
-                    
-                    storage_state_next = float(storage_state + float(x_t.detach()) - float(z_t.detach()))
-                    x_prev_global = x_t.detach()
+                    # Track previous storage (for refresh condition), then update differentiably
+                    prev_storage_scalar = float(storage_state.detach().item())
+                    storage_state = torch.clamp(storage_state + x_t - z_t, min=0.0, max=S)
+                    # Propagate previous x as tensor (no detach)
+                    x_prev_global = x_t
 
                     # if the storage will be empty and it was previously non-empty, we can refresh the base drivers
-                    if storage_state_next <= 1e-9 and storage_state > 1e-9:
+                    s_now = float(storage_state.detach().item())
+                    s_prev = prev_storage_scalar
+                    if s_now <= 1e-9 and s_prev > 1e-9:
                         # print(f"[info] t={t} storage emptied, refreshing base drivers")
                         base_drivers = []  # reset previous base drivers
                         feats = build_driver_features(
@@ -790,9 +820,10 @@ try:
                             kind="base", b_or_f=S, delta_idx=T, p_min=float(p_min), p_max=float(p_max)
                         )
                         y_vec_t, _, _ = model(feats, p_min=float(p_min), p_max=float(p_max))
-                        base_drivers.append({"id": 0, "b": S, "w": 0.0, "prev_decision": 0.0, "y_vec": y_vec_t})
-
-                    storage_state = max(0.0, min(S, storage_state_next))    
+                        base_drivers.append({"id": 0, "b": S, 
+                                             "w": torch.tensor(0.0, dtype=torch.float32).reshape(-1), 
+                                             "prev_decision": torch.tensor(0.0, dtype=torch.float32).reshape(-1), "y_vec": y_vec_t})
+                    # storage_state already clamped    
                     
                     # record sequences for torch objective
                     x_hist.append(x_t)
@@ -809,6 +840,18 @@ try:
                     opt_val = opt_costs_all[global_idx] if opt_costs_all is not None else None
                     if opt_val is not None and opt_val > 1e-9:
                         cr_val = float(pald_cost.item()) / float(opt_val)
+                        if cr_val < 1.0:
+                            cr_val = 1.0  # numerical issues
+                            # for debugging, if the competitive ratio is less than one, print the following:
+                            # the total amount of demand (sum of base and flex)
+                            total_demand = sum(base_seq) + sum(flex_seq)
+                            print(f"[warning] pald cost {pald_cost.item():.3f} < opt {opt_val:.3f}, total demand {total_demand}, setting CR=1.0")
+                            # also print the amount delivered by PALD
+                            print(f"  total delivered: {float(torch.sum(z_torch).item()):.3f}")
+                            # print the purchasing sequence
+                            print(f"  purchasing: {[float(v.detach().item()) for v in x_torch]}")
+                            # print the delivery sequence
+                            print(f"  delivery: {[float(v.detach().item()) for v in z_torch]}")
                         batch_crs.append(cr_val)
                 except Exception:
                     pass
@@ -1002,277 +1045,18 @@ try:
             # (no LR scheduler)
 
 except KeyboardInterrupt:
-    print("[train] Caught KeyboardInterrupt. Skipping remaining training and running evaluation...")
+    print("[train] Caught KeyboardInterrupt. Skipping remaining training...")
 
-# Evaluate PALD, PAAD, and OPT on the first instance and plot time series
-# Forward PALD rollout with learned thresholds (for visualization only)
-def forward_pald(price_seq, time_seq, month_seq, forecast_seq, base_seq, flex_seq, Delta_seq):
-    x_list, z_list, s_list = [], [], []
-    storage_state = 0.0
-    x_prev_global = torch.tensor(0.0)
-
-    # thresholds predicted per-driver via model
-
-    base_drivers = [{"id": 0, "b": S, "w": 0.0, "prev_decision": 0.0}]
-    flex_drivers = []
-
-    with torch.no_grad():
-        for t in range(T):
-            b_t_val = float(base_seq[t])
-            p_t_val = float(price_seq[t])
-            # arrivals
-            if b_t_val > 0:
-                base_drivers.append({"id": 2 * t + 2, "b": b_t_val, "w": 0.0, "prev_decision": 0.0})
-            f_arrival = float(flex_seq[t])
-            if f_arrival > 0:
-                flex_drivers.append({"id": 2 * t + 1, "f": f_arrival, "delta": int(Delta_seq[t]), "w": 0.0, "v": 0.0, "prev_x": 0.0, "prev_z": 0.0})
-
-            prev_purchasing_total = sum(drv["prev_decision"] * drv["b"] for drv in base_drivers)
-            prev_purchasing_total += sum(fd["prev_x"] * fd["f"] for fd in flex_drivers)
-            purchasing_excess = x_prev_global.item() - prev_purchasing_total
-
-            decisions = []
-            # base purchase
-            for drv in base_drivers:
-                b_i = drv["b"]
-                prev_frac = drv["prev_decision"]
-                denom = prev_purchasing_total if prev_purchasing_total > 0 else 1.0
-                share = (prev_frac * b_i) / denom if prev_purchasing_total > 0 else 0.0
-                pseudo_prev_frac = prev_frac + max(0.0, purchasing_excess) * share / max(b_i, 1e-8)
-                w_prev_frac = float(drv["w"])
-                w_eff = max(0.0, min(1.0 - 1e-9, w_prev_frac))
-                caps_list = compute_segment_caps(w_eff, K)
-                if (1.0 - w_eff) <= 1e-9 or sum(caps_list) <= 1e-12:
-                    cur_frac_decision = torch.tensor(0.0, dtype=torch.float32)
-                else:
-                    x_prev_clamped = max(0.0, min(1.0 - w_eff, float(pseudo_prev_frac)))
-                    x_prev_frac_t = torch.tensor(x_prev_clamped, dtype=torch.float32)
-                    w_prev_frac_t = torch.tensor(w_eff, dtype=torch.float32)
-                    p_t_t = torch.tensor(p_t_val, dtype=torch.float32)
-                    caps_t = torch.tensor(caps_list, dtype=torch.float32)
-                    y_pred, _, _ = model(build_driver_features(
-                        t_idx=t, T=T, price_seq=price_seq, time_seq=time_seq, month_seq=month_seq, forecast_seq=forecast_seq,
-                        storage_state=storage_state,
-                        kind="base", b_or_f=b_i, delta_idx=t, p_min=float(p_min), p_max=float(p_max)
-                    ), p_min=float(p_min), p_max=float(p_max))
-                    cur_frac_decision = _safe_layer_call(
-                        pald_base_layer, (x_prev_frac_t, w_prev_frac_t, p_t_t, y_pred, caps_t), size=(1.0 - w_eff)
-                    )
-                cur_phys_decision = float(cur_frac_decision.item() * b_i)
-                decisions.append(cur_phys_decision)
-                drv["prev_decision"] = float(cur_frac_decision.item())
-                drv["w"] = float(min(1.0, drv["w"] + drv["prev_decision"]))
-
-            # flex purchase
-            for fd in flex_drivers:
-                f_i = fd["f"]
-                prev_frac = fd["prev_x"]
-                denom = prev_purchasing_total if prev_purchasing_total > 0 else 1.0
-                share = (prev_frac * f_i) / denom if prev_purchasing_total > 0 else 0.0
-                pseudo_prev_frac = prev_frac + max(0.0, purchasing_excess) * share / max(f_i, 1e-8)
-                w_prev_frac = float(fd["w"])
-                w_eff = max(0.0, min(1.0 - 1e-9, w_prev_frac))
-                caps_list = compute_segment_caps(w_eff, K)
-                if (1.0 - w_eff) <= 1e-9 or sum(caps_list) <= 1e-12:
-                    cur_frac_x = torch.tensor(0.0, dtype=torch.float32)
-                else:
-                    x_prev_clamped = max(0.0, min(1.0 - w_eff, float(pseudo_prev_frac)))
-                    x_prev_frac_t = torch.tensor(x_prev_clamped, dtype=torch.float32)
-                    w_prev_frac_t = torch.tensor(w_eff, dtype=torch.float32)
-                    p_t_t = torch.tensor(p_t_val, dtype=torch.float32)
-                    caps_t = torch.tensor(caps_list, dtype=torch.float32)
-                    _, y_fp_pred, _ = model(build_driver_features(
-                        t_idx=t, T=T, price_seq=price_seq, time_seq=time_seq, month_seq=month_seq, forecast_seq=forecast_seq,
-                        storage_state=storage_state,
-                        kind="flex", b_or_f=f_i, delta_idx=int(fd["delta"]), p_min=float(p_min), p_max=float(p_max)
-                    ), p_min=float(p_min), p_max=float(p_max))
-                    cur_frac_x = _safe_layer_call(
-                        pald_flex_purchase_layer, (x_prev_frac_t, w_prev_frac_t, p_t_t, y_fp_pred, caps_t), size=(1.0 - w_eff)
-                    )
-                cur_phys_x = float(cur_frac_x.item() * f_i)
-                decisions.append(cur_phys_x)
-                fd["prev_x"] = float(cur_frac_x.item())
-                fd["w"] = float(min(1.0, fd["w"] + fd["prev_x"]))
-
-            # Aggregate initial purchases
-            x_t = sum(decisions)
-
-            # deliveries
-            z_components = [b_t_val]
-            # Track deadline purchase needs to attribute same-slot top-up
-            deadline_needs = []  # list of (fd_index, need_phys)
-            for idx_fd, fd in enumerate(flex_drivers):
-                f_i = fd["f"]
-                v_prev = float(fd["v"])
-                w_prev = float(fd["w"])
-                v_eff = max(0.0, min(1.0 - 1e-9, v_prev))
-                caps_list = compute_segment_caps(v_eff, K)
-                if (1.0 - v_eff) <= 1e-9 or sum(caps_list) <= 1e-12:
-                    cur_frac_z = torch.tensor(0.0, dtype=torch.float32)
-                else:
-                    z_prev_clamped = max(0.0, min(1.0 - v_eff, float(fd["prev_z"])))
-                    z_prev_frac_t = torch.tensor(z_prev_clamped, dtype=torch.float32)
-                    v_prev_frac_t = torch.tensor(v_eff, dtype=torch.float32)
-                    caps_t = torch.tensor(caps_list, dtype=torch.float32)
-                    coeff_t = torch.tensor(
-                        p_t_val * ((c_delivery + eps_delivery) - c_delivery * float(max(0.0, storage_state))),
-                        dtype=torch.float32,
-                    )
-                    _, _, y_fd_pred = model(build_driver_features(
-                        t_idx=t, T=T, price_seq=price_seq, time_seq=time_seq, month_seq=month_seq, forecast_seq=forecast_seq,
-                        storage_state=storage_state,
-                        kind="flex", b_or_f=f_i, delta_idx=int(fd["delta"]), p_min=float(p_min), p_max=float(p_max)
-                    ), p_min=float(p_min), p_max=float(p_max))
-                    cur_frac_z = _safe_layer_call(
-                        pald_flex_delivery_layer, (z_prev_frac_t, v_prev_frac_t, coeff_t, y_fd_pred, caps_t), size=(1.0 - v_eff)
-                    )
-                # Enforce deadline
-                if t >= max(0, int(fd["delta"]) - 1):
-                    # Force delivery of the remaining fraction
-                    cur_frac_z = torch.tensor(max(0.0, 1.0 - v_prev), dtype=torch.float32)
-                    # Compute additional purchase needed for this driver this slot (in physical units)
-                    avail_frac = max(0.0, w_prev - v_prev)
-                    need_frac = max(0.0, float(cur_frac_z.item()) - avail_frac)
-                    need_phys = need_frac * f_i
-                    if need_phys > 0:
-                        deadline_needs.append((idx_fd, need_phys))
-                else:
-                    # For non-deadline, cap by purchased remainder
-                    cur_frac_z = torch.clamp(cur_frac_z, max=max(0.0, w_prev - v_prev))
-
-                cur_phys_z = float(cur_frac_z.item() * f_i)
-                z_components.append(cur_phys_z)
-                fd["prev_z"] = float(cur_frac_z.item())
-                # v will be updated after possible purchase top-up attribution
-
-            z_t = sum(z_components)
-
-            # inventory feasibility and same-slot purchase top-up attribution
-            x_required = max(0.0, z_t - storage_state)
-            if x_t + 1e-12 < x_required:
-                extra_phys = x_required - x_t
-                # Attribute extra purchases to deadline jobs that need it to keep v ≤ w
-                total_need = sum(need for _, need in deadline_needs)
-                if total_need > 1e-12:
-                    for idx_fd, need_phys in deadline_needs:
-                        alloc_phys = extra_phys * (need_phys / total_need)
-                        fd = flex_drivers[idx_fd]
-                        # convert to fractional increment for this driver and clip to remaining capacity
-                        inc_frac = min(1.0 - float(fd["w"]), alloc_phys / max(fd["f"], 1e-8))
-                        if inc_frac > 0:
-                            fd["prev_x"] += inc_frac
-                            fd["w"] = float(min(1.0, fd["w"] + inc_frac))
-                x_t = x_t + extra_phys  # apply global top-up
-
-            # Now update v after purchases (so v ≤ w holds)
-            for fd in flex_drivers:
-                fd["v"] = float(min(1.0, fd["v"] + fd["prev_z"]))
-
-            # finalize inventory and histories
-            storage_state = storage_state + x_t - z_t
-            x_prev_global = torch.tensor(x_t)
-            x_list.append(x_t)
-            z_list.append(z_t)
-            s_list.append(storage_state)
-
-    return x_list, z_list, s_list
-
-def evaluate_and_plot_instance0(prefix: str = 'eval_instance0'):
-    import matplotlib.pyplot as plt
-
-    if not price_all or not base_all:
-        print("No instances available for evaluation.")
-        return
-
-    p0 = price_all[0]
-    t0 = times_all[0]
-    m0 = months_all[0]
-    fc0 = forecast_all[0]
-    b0 = base_all[0]
-    f0 = flex_all[0]
-    Delta0 = Delta_all[0]
-
-    # PALD forward pass with learned y
-    pald_x, pald_z, pald_s = forward_pald(p0, t0, m0, fc0, b0, f0, Delta0)
-
-    # PAAD baseline
-    paad_res = pi.paad_algorithm(T, p0, gamma, delta, c_delivery, eps_delivery, p_min, p_max, S, b0, f0, Delta0)
-    paad_x = paad_res['x']
-    paad_z = paad_res['z']
-    paad_s = paad_res['s'][1:]  # drop initial
-
-    # Offline OPT (if available)
-    opt_x = opt_z = opt_s = None
-    opt_cost = None
+# save the model at the end of training
+if best_snapshot["model_state"] is not None:
     try:
-        status, results = opt_sol.optimal_solution(T, p0, gamma, delta, c_delivery, eps_delivery, S, b0, f0, Delta0)
-        if status == "Optimal" and results is not None:
-            opt_x = results['x']
-            opt_z = results['z']
-            opt_s = results['s'][1:]
-            # Use numpy objective for consistency
-            opt_cost = np_objective_function(T, p0, gamma, delta, c_delivery, eps_delivery, opt_x, opt_z)
+        os.makedirs("best_models", exist_ok=True)
+        model_path = f"best_models/pald_model_{trace}_{month}_{batch_size}_{run_tag}.pt"
+        torch.save(best_snapshot["model_state"], model_path)
+        run_generated_files.append(model_path)
+        print(f"Saved model: {model_path}")
     except Exception as e:
-        print(f"OPT evaluation failed: {e}")
-
-    # Time axis
-    t = list(range(T))
-
-    fig, axes = plt.subplots(4, 1, figsize=(8, 10), sharex=True)
-    axes[0].plot(t, p0, label='price', color='black')
-    axes[0].set_ylabel('price')
-    axes[0].legend()
-
-    axes[1].plot(t, pald_x, label='PALD x', color='tab:blue')
-    axes[1].plot(t, paad_x, label='PAAD x', color='tab:orange')
-    if opt_x is not None:
-        axes[1].plot(t, opt_x, label='OPT x', color='tab:green')
-    axes[1].set_ylabel('purchasing x')
-    axes[1].legend()
-
-    axes[2].plot(t, pald_z, label='PALD z', color='tab:blue')
-    axes[2].plot(t, paad_z, label='PAAD z', color='tab:orange')
-    if opt_z is not None:
-        axes[2].plot(t, opt_z, label='OPT z', color='tab:green')
-    axes[2].set_ylabel('delivery z')
-    axes[2].legend()
-
-    axes[3].plot(t, pald_s, label='PALD s', color='tab:blue')
-    axes[3].plot(t, paad_s, label='PAAD s', color='tab:orange')
-    if opt_s is not None:
-        axes[3].plot(t, opt_s, label='OPT s', color='tab:green')
-    axes[3].set_ylabel('storage s')
-    axes[3].set_xlabel('time t')
-    axes[3].legend()
-
-    plt.tight_layout()
-    outfile = f"{prefix}.png"
-    plt.savefig(outfile, dpi=150)
-    print(f"Saved {outfile}")
-
-    # Compute and print competitive ratios if OPT cost available
-    pald_cost = np_objective_function(T, p0, gamma, delta, c_delivery, eps_delivery, pald_x, pald_z)
-    paad_cost = np_objective_function(T, p0, gamma, delta, c_delivery, eps_delivery, paad_x, paad_z)
-    if opt_cost is not None and opt_cost > 0:
-        print(f"OPT objective: {opt_cost:.4f}")
-        print(f"PAAD objective: {paad_cost:.4f}  | Competitive ratio (PAAD/OPT): {paad_cost/opt_cost:.4f}")
-        print(f"PALD objective: {pald_cost:.4f}  | Competitive ratio (PALD/OPT): {pald_cost/opt_cost:.4f}")
-
-        # report the total delivered amounts for OPT, PAAD, PALD
-        total_opt_z = sum(opt_z) if opt_z is not None else 0.0
-        total_paad_z = sum(paad_z) if paad_z is not None else 0.0
-        total_pald_z = sum(pald_z) if pald_z is not None else 0.0
-        print(f"Total delivered: OPT={total_opt_z:.2f}, PAAD={total_paad_z:.2f}, PALD={total_pald_z:.2f}")
-    else:
-        print(f"PAAD objective: {paad_cost:.4f}")
-        print(f"PALD objective: {pald_cost:.4f}")
-    return outfile  # [ADD] return saved filename
-
-# Run evaluation before and after training
-# Post-training evaluation
-eval_outfile = evaluate_and_plot_instance0(prefix=f'eval_instance0_{run_tag}_{trace}_{month}')
-if eval_outfile:
-    run_generated_files.append(eval_outfile)
+        print(f"Model save failed: {e}")
 
 # Write a simple text log for this run
 try:

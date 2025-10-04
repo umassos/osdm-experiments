@@ -226,7 +226,7 @@ def hinge_from_y_torch(taus_full_t: torch.Tensor, y: torch.Tensor):
     w = torch.cat([w0, wj], dim=-1)                             # (..., K)
 
     # Nonnegativity projection; subgradients pass where w>0
-    # w = torch.clamp(w, min=0.0)
+    w = torch.clamp(w, min=0.0)
 
     # c1 = -g(τ0) = -y[..., 0]
     c1 = -y[..., 0]
