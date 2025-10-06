@@ -136,17 +136,19 @@ def load_signal_trace_with_context(filename, month=1):
         forecast_df = forecast_df[forecast_df.index.month == month]
     # print the df.head
     # print(df.head())
-    signal = df["lmp"]
+    
     forecast_signal = forecast_df["lmp"]
     # if there are any negative prices, set them to one
-    signal[signal < 1.0] = 1.0
     forecast_signal[forecast_signal < 1.0] = 1.0
-
-    p_min = signal.min()
+    
     # get the 99th percentile of the signal to avoid outliers
-    p_99 = signal.quantile(0.99).copy()
+    p_99 = df["lmp"].quantile(0.99).copy()
     # cap the signal at the 99th percentile
-    signal.loc[signal > p_99] = p_99
+    df.loc[df['lmp'] > p_99, 'lmp'] = p_99
+    # if there are any negative prices, set them to one
+    df["lmp"][df["lmp"] < 1.0] = 1.0
+    signal = df["lmp"]
+    p_min = signal.min()
     p_max = signal.max()
 
     # extract the sequence of datetime indexes
