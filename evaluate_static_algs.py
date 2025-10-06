@@ -465,7 +465,7 @@ def evaluate_many(price_all, base_all, flex_all, Delta_all, tracking_target_all,
     return rows
 
 def main():
-    max_month = 1
+    max_month = 12
 
     print(f"Evaluating {args.num_instances} instances (trace={args.trace})...")
     month_data = []

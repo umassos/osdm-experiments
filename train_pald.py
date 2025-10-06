@@ -3,7 +3,7 @@ import os
 import argparse
 import torch.optim as optim
 from functions import load_scenarios_with_flexible
-from pald_implementation import (
+from pald_static_implementation import (
     make_pald_base_layer,
     make_pald_flex_purchase_layer,
     make_pald_flex_delivery_layer,
@@ -35,7 +35,8 @@ parser.add_argument('--batch_size', type=int, default=100, help='Batch size for 
 parser.add_argument('--num_batches', type=int, default=1, help='Number of batches per epoch (default: 1)')
 parser.add_argument('--use_cost_loss', action='store_true', help='Use total cost loss instead of competitive-ratio loss')
 parser.add_argument('--pretraining_loop', type=int, default=200, help='Number of epochs to pretrain with random thresholds (default: 200)')
-parser.add_argument('--trace', type=str, default="PJM", help='Trace name to use (default: PJM)')
+parser.add_argument('--trace', type=str, default="CAISO", help='Trace name to use (default: CAISO)')
+parser.add_argument('--scale_factor', type=float, default=640.0, help='Scale factor for demands (default: 40.0)')
 parser.add_argument('--month', type=int, default=1, help='Month to filter for in trace (default: 1, 99 for all)')
 args = parser.parse_args()
 
@@ -46,7 +47,7 @@ S = 1.0          # maximum inventory capacity
 T = 48          # 12 hours in 15-minute intervals
 c_delivery = 0.2
 eps_delivery = 0.05
-epochs = 500
+epochs = 210
 # get batch size from command line 
 batch_size = args.batch_size
 # get length of pretraining loop from command line
@@ -57,12 +58,20 @@ num_batches = args.num_batches
 use_cost_loss = args.use_cost_loss
 # get trace name from command line
 trace = args.trace
+# get scale factor from command line
+scale_factor = args.scale_factor
 month = args.month
 learning_rate = 0.1
 
 # Prefetch all scenarios for all batches (e.g., 25 * 100 = 2500)
 total_instances = batch_size * num_batches
 price_all, base_all, flex_all, Delta_all, p_min, p_max = load_scenarios_with_flexible(total_instances, T, trace, month=month)
+
+if scale_factor != 40.0:
+    # rescale demands by the new scale factor (e.g., if scale factor = 80, divide all demands by 2)
+    divisor = scale_factor / 40.0
+    base_all = [[b / divisor for b in seq] for seq in base_all]
+    flex_all = [[f / divisor for f in seq] for seq in flex_all]
 
 # compute the minimum and maximum prices across the actual instances we consider
 all_prices_flat = [price for seq in price_all for price in seq]
@@ -71,7 +80,7 @@ price_max = max(all_prices_flat) if all_prices_flat else float('-inf')
 
 alpha = float(get_alpha(float(p_min), float(p_max), c_delivery, eps_delivery, 96, gamma, delta))
 print(f"Computed alpha for analytical thresholds: {alpha}")
-beta = 5*alpha
+beta = 100
 
 # ---------------------------------------
 # Precompute OPT costs for competitive-ratio loss
@@ -270,19 +279,19 @@ try:
             with torch.no_grad():
                 price_batch = price_all[start:end]
                 price_seq = price_batch[0]
-                y_random = torch.rand(K) * (float(price_max) - float(price_min)) + float(price_min)
+                y_random = torch.rand(K) * (float(p_max) - float(p_min)) + float(p_min)
                 y_random, _ = torch.sort(y_random, descending=True)
-                y_random[-1] = float(p_min) + 2.0 * float(gamma)
+                # y_random[-1] = float(p_min) + 2.0 * float(gamma)
                 y.copy_(y_random)
 
-                y_flex_p_random = torch.rand(K) * (float(price_max) - float(price_min)) + float(price_min)
+                y_flex_p_random = torch.rand(K) * (float(p_max) - float(p_min)) + float(p_min)
                 y_flex_p_random, _ = torch.sort(y_flex_p_random, descending=True)
-                y_flex_p_random[-1] = float(price_min) + 2.0 * float(gamma)
+                # y_flex_p_random[-1] = float(p_min) + 2.0 * float(gamma)
                 y_flex_p.copy_(y_flex_p_random)
 
-                y_flex_d_random = torch.rand(K) * (float(price_max) * (c_delivery + eps_delivery) - float(price_min) * (c_delivery + eps_delivery)) + float(price_min) * (c_delivery + eps_delivery)
+                y_flex_d_random = torch.rand(K) * (float(p_max) * (c_delivery + eps_delivery) - float(p_min) * (c_delivery + eps_delivery)) + float(p_min) * (c_delivery + eps_delivery)
                 y_flex_d_random, _ = torch.sort(y_flex_d_random, descending=True)
-                y_flex_d_random[-1] = float(price_min) * (c_delivery + eps_delivery) + 2.0 * float(delta)
+                # y_flex_d_random[-1] = float(p_min) * (c_delivery + eps_delivery) + 2.0 * float(delta)
                 y_flex_d.copy_(y_flex_d_random)
 
                 # project to ensure robustness
@@ -645,7 +654,7 @@ with torch.no_grad():
         # [CHG] Save tagged best-thresholds file
         os.makedirs("best_thresholds", exist_ok=True)
         import pickle
-        best_outfile = f"best_thresholds/best_thresholds_{trace}_{month}_{batch_size}_{run_tag}.pkl"
+        best_outfile = f"best_thresholds/best_thresholds_scalefactor_{scale_factor}_{trace}_{month}_{batch_size}_{run_tag}.pkl"
         with open(best_outfile, 'wb') as f:
             pickle.dump({
                 'y_base': y.detach().cpu().numpy().tolist(),
