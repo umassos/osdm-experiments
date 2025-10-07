@@ -30,13 +30,8 @@ except Exception:
     opt_sol = None
     _HAS_GUROBI = False
 
-# Use the same (no-op) solver_args as in train_pald.py calls for consistency
-
-# pald_model_CAISO_99_32_10030053 - calibrated to optimal random, no robustness in the loop
-# pald_model_CAISO_99_32_10030848 - no optimal random, robustness in the loop
-
 parser = argparse.ArgumentParser(description="Evaluate PALD-Contextual and PAAD over many instances.")
-parser.add_argument("--num_instances", type=int, default=10, help="Number of instances to evaluate (default: 1)")
+parser.add_argument("--num_instances", type=int, default=100, help="Number of instances to evaluate (default: 1)")
 parser.add_argument("--trace", type=str, default="CAISO", help="Trace name (default from file config)")
 parser.add_argument("--saved_model_dir", type=str, default="best_models_v1/", help="Directory with learned models (default: best_models_v1/)")
 parser.add_argument("--T", type=int, default=48, help="Time horizon (default: 48)")
