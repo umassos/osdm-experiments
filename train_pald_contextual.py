@@ -44,7 +44,7 @@ Pipeline:
     10) objective: accumulate torch objective; repeat for t+1
 """
 
-torch.set_num_threads(os.cpu_count() or 4)
+torch.set_num_threads(2)
 
 # [ADD] Capture run start time/tag and a list of generated files
 run_start_dt = datetime.now()
@@ -57,13 +57,14 @@ run_generated_files: list[str] = []
 solver_options = {}
 
 parser = argparse.ArgumentParser(description="Train PALD with flexible demand and deadlines.")
-parser.add_argument('--batch_size', type=int, default=4, help='Batch size for training (default: 4)')
+parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training (default: 32)')
 parser.add_argument('--num_batches', type=int, default=1, help='Number of batches per epoch (default: 1)')
 parser.add_argument('--use_cost_loss', action='store_true', help='Use total cost loss instead of competitive-ratio loss')
 parser.add_argument('--trace', type=str, default="CAISO", help='Trace name to use (default: CAISO)')
 parser.add_argument('--month', type=int, default=99, help='Month to filter for in trace (default: 1, 99 for all)')
 parser.add_argument('--warmup_epochs', type=int, default=100, help='Supervised warm-up epochs to align y0 to OPT/quantile targets')
-parser.add_argument('--warmup_lambda', type=float, default=1000.0, help='Weight of warm-up y0 loss during warm-up phase')
+parser.add_argument('--warmup_lambda', type=float, default=100.0, help='Weight of warm-up y0 loss during warm-up phase')
+parser.add_argument('--warmup_lr', type=float, default=0.01, help='Learning rate to use during warm-up epochs')
 parser.add_argument('--y0_margin', type=float, default=10.0, help='Margin to add to OPT avg price for base/flex purchase y0 target')
 parser.add_argument('--post_warmup_epochs', type=int, default=0, help='Number of epochs to decay anchor after warm-up')
 parser.add_argument('--post_warmup_lambda', type=float, default=1.0, help='Initial weight of post-warmup anchor (decays to 0)')
@@ -89,11 +90,20 @@ use_cost_loss = args.use_cost_loss
 # get trace name from command line
 trace = args.trace
 month = args.month
-learning_rate = 0.0001
+learning_rate = 0.001
 
 # Prefetch all scenarios for all batches (e.g., 25 * 100 = 2500)
 total_instances = batch_size * num_batches
 price_all, times_all, months_all, forecast_all, base_all, flex_all, Delta_all, p_min, p_max = load_scenarios_with_flexible_context(total_instances, T, trace, month=month, saved=False)
+
+## Contextual thresholds model (MonotoneHead with softplus cumulative form)
+feature_dim = 11  # handcrafted features length (see build_driver_features)
+model = ThresholdPredictor(input_dim=feature_dim, K=K+1, hidden_dims=(64, 64), 
+                           p_min=float(p_min), p_max=float(p_max), use_robust_projection=True)
+# model = ThresholdPredictor(input_dim=feature_dim, K=K+1, hidden_dims=(64, 64))
+model_device = torch.device("cpu")
+model.to(model_device)
+model.train()
 
 # ---------------------------------------
 # Precompute OPT costs for competitive-ratio loss
@@ -115,9 +125,13 @@ def precompute_opt_costs_flex(price_instances, base_instances, flex_instances, D
             if status == "Optimal" and results is not None:
                 opt_cost = np_objective_function(T, p_seq, gamma, delta, c, eps, results['x'], results['z'])
                 x_opt = results['x']
-                denom = sum(x_opt)
+                # choose the indices in p_seq and x_opt that correspond to b_seq == 0
+                p_seq_b0 = [pt for pt, bt in zip(p_seq, b_seq) if bt == 0]
+                x_opt_b0 = [xt for xt, bt in zip(x_opt, b_seq) if bt == 0]
+                denom = sum(x_opt_b0)
                 if denom and denom > 1e-9:
-                    num = sum(pt * xt for pt, xt in zip(p_seq, x_opt))
+                    # compute the average price purchased outside of forced
+                    num = sum(pt * xt for pt, xt in zip(p_seq_b0, x_opt_b0))
                     avg_p = float(num / denom)
                 else:
                     avg_p = None
@@ -164,15 +178,6 @@ for i in range(total_instances):
     base_y0_targets.append(tgt)
     flexp_y0_targets.append(tgt)
     flexd_y0_targets.append(tgt*(c_delivery + eps_delivery))  # flex delivery y0 target scaled
-
-# random_base_targets, random_flexp_targets, random_flexd_targets = 
-
-# Instantiate contextual model
-feature_dim = 11  # handcrafted features length (see build_driver_features)
-model = ThresholdPredictor(input_dim=feature_dim, K=K+1, hidden_dims=(64, 64))
-model_device = torch.device("cpu")
-model.to(model_device)
-model.train()
 
 # Initialize top-gate biases toward mean OPT accepted price (if available)
 try:
@@ -399,6 +404,9 @@ try:
 
         # Enable/disable parameter groups depending on warm-up (only the boolean; per-param freezing remains off)
         warmup_active = epoch < int(args.warmup_epochs)
+        # Set optimizer learning rate depending on warm-up phase
+        for pg in optimizer.param_groups:
+            pg['lr'] = float(args.warmup_lr) if warmup_active else float(learning_rate)
         # if warmup_active:
         #     # Freeze everything except the top gate biases/weights to shape y0
         #     for name, p in model.named_parameters():
@@ -580,10 +588,6 @@ try:
                         if t >= max(0, int(fd["delta"])):
                             # need to deliver remainder
                             cur_frac_z = torch.clamp(1.0 - v_prev_frac, min=0.0).reshape(-1)
-                            z_components.append(cur_frac_z)
-                            fd["prev_z"] = cur_frac_z.reshape(-1)
-                            fd["v"] = (fd["v"] + cur_frac_z).reshape(-1)
-                            continue
                         # if w is really low, just force a zero decision
                         if float(w_prev_frac.detach().item()) <= 1e-9:
                             # no more buying possible, force zero decision
@@ -736,12 +740,6 @@ try:
                         if t >= max(0, int(fd["delta"])):
                             # need to buy remainder
                             cur_frac_x = torch.clamp(1.0 - w_prev_frac, min=0.0).reshape(-1)
-                            decisions.append(cur_frac_x)
-                            fd["prev_x"] = cur_frac_x
-                            fd["w"] = (fd["w"] + fd["prev_x"]).reshape(-1)
-                            cur_phys_x = torch.mul(cur_frac_x, f_i).reshape(-1)
-                            buy_cap_t = buy_cap_t - cur_phys_x
-                            continue
                         else:
                             # x_prev_clamped = max(0.0, min(1.0 - w_eff, float(pseudo_prev_x)))
 
@@ -840,18 +838,18 @@ try:
                     opt_val = opt_costs_all[global_idx] if opt_costs_all is not None else None
                     if opt_val is not None and opt_val > 1e-9:
                         cr_val = float(pald_cost.item()) / float(opt_val)
-                        if cr_val < 1.0:
-                            cr_val = 1.0  # numerical issues
+                        # if cr_val < 1.0:
+                            # cr_val = 1.0  # numerical issues
                             # for debugging, if the competitive ratio is less than one, print the following:
                             # the total amount of demand (sum of base and flex)
-                            total_demand = sum(base_seq) + sum(flex_seq)
-                            print(f"[warning] pald cost {pald_cost.item():.3f} < opt {opt_val:.3f}, total demand {total_demand}, setting CR=1.0")
-                            # also print the amount delivered by PALD
-                            print(f"  total delivered: {float(torch.sum(z_torch).item()):.3f}")
-                            # print the purchasing sequence
-                            print(f"  purchasing: {[float(v.detach().item()) for v in x_torch]}")
-                            # print the delivery sequence
-                            print(f"  delivery: {[float(v.detach().item()) for v in z_torch]}")
+                            # total_demand = sum(base_seq) + sum(flex_seq)
+                            # print(f"[warning] pald cost {pald_cost.item():.3f} < opt {opt_val:.3f}, total demand {total_demand}, setting CR=1.0")
+                            # # also print the amount delivered by PALD
+                            # print(f"  total delivered: {float(torch.sum(z_torch).item()):.3f}")
+                            # # print the purchasing sequence
+                            # print(f"  purchasing: {[float(v.detach().item()) for v in x_torch]}")
+                            # # print the delivery sequence
+                            # print(f"  delivery: {[float(v.detach().item()) for v in z_torch]}")
                         batch_crs.append(cr_val)
                 except Exception:
                     pass
@@ -908,49 +906,49 @@ try:
             # Save CRs for summary printing
             last_batch_crs = batch_crs
 
-            # Smoothness regularization on a sample predicted vector: encourage gradual thresholds
-            shape_penalty = torch.tensor(0.0)
-            if len(price_batch) > 0:
-                feats_s = build_driver_features(0, T, price_batch[0], time_batch[0], month_batch[0], forecast_batch[0], 0.0, "base", S, 0, float(p_min), float(p_max))
-                yb, yp, yd = model(feats_s, p_min=float(p_min), p_max=float(p_max))
-                def smoothness(y):
-                    dif = y[:-1] - y[1:]  # non-negative by design
-                    return (dif * dif).sum()
-                shape_penalty = 0.01 * smoothness(yb) + 0.005 * smoothness(yp) + 0.005 * smoothness(yd)
-
-            # Final loss: CR/cost loss + small shape penalty + warm-up (if active) + top-up penalty + post-warmup anchor
             if warmup_active:
-                # Average warm-up over batch
-                warmup_term = (warmup_loss_sum / max(1, batch_size)) * float(args.warmup_lambda)
+                # Exclusively optimize warm-up y0 loss during warm-up phase
+                loss = (warmup_loss_sum / max(1, batch_size)) * float(args.warmup_lambda)
             else:
-                warmup_term = torch.tensor(0.0)
-            topup_term = torch.tensor(float(epoch_forced_topup_sum), dtype=torch.float32) * float(args.topup_penalty_lambda)
-            # Post-warmup anchor: decays linearly to 0 over post_warmup_epochs
-            if not warmup_active and int(args.post_warmup_epochs) > 0:
-                post_warm = max(0, epoch - int(args.warmup_epochs))
-                decay = max(0.0, 1.0 - (post_warm / float(args.post_warmup_epochs)))
-                anchor_w = float(args.post_warmup_lambda) * decay
-                # Use same y0 targets as warm-up; only include base and flex purchase heads
-                # Compute average anchor over this batch
-                anchor_sum = torch.tensor(0.0)
-                count = 0
-                for idx, price_seq in enumerate(price_batch):
-                    global_idx = start + idx
-                    try:
-                        y0_tgt = float(base_y0_targets[global_idx])
-                        feats_b0 = build_driver_features(0, T, price_seq, time_batch[idx], month_batch[idx], forecast_batch[idx], 0.0, "base", S, 0, float(p_min), float(p_max))
-                        yb_all, yfp_all, _ = model(feats_b0, p_min=float(p_min), p_max=float(p_max))
-                        yb0 = yb_all[0]
-                        yfp0 = yfp_all[0]
-                        y0_tgt_t = torch.tensor(y0_tgt, dtype=torch.float32)
-                        anchor_sum = anchor_sum + (torch.abs(yb0 - y0_tgt_t) + torch.abs(yfp0 - y0_tgt_t))
-                        count += 1
-                    except Exception:
-                        pass
-                anchor_term = (anchor_sum / max(1, count)) * anchor_w
-            else:
-                anchor_term = torch.tensor(0.0)
-            loss = batch_total_loss + shape_penalty + warmup_term + topup_term + anchor_term
+                # Smoothness regularization on a sample predicted vector: encourage gradual thresholds
+                shape_penalty = torch.tensor(0.0)
+                if len(price_batch) > 0:
+                    feats_s = build_driver_features(0, T, price_batch[0], time_batch[0], month_batch[0], forecast_batch[0], 0.0, "base", S, 0, float(p_min), float(p_max))
+                    yb, yp, yd = model(feats_s, p_min=float(p_min), p_max=float(p_max))
+                    def smoothness(y):
+                        dif = y[:-1] - y[1:]  # non-negative by design
+                        return (dif * dif).sum()
+                    shape_penalty = 0.01 * smoothness(yb) + 0.005 * smoothness(yp) + 0.005 * smoothness(yd)
+
+                # Final loss post-warmup: CR/cost + shape + top-up penalty + post-warmup anchor
+                topup_term = torch.tensor(float(epoch_forced_topup_sum), dtype=torch.float32) * float(args.topup_penalty_lambda)
+                # Post-warmup anchor: decays linearly to 0 over post_warmup_epochs
+                if int(args.post_warmup_epochs) > 0:
+                    post_warm = max(0, epoch - int(args.warmup_epochs))
+                    decay = max(0.0, 1.0 - (post_warm / float(args.post_warmup_epochs)))
+                    anchor_w = float(args.post_warmup_lambda) * decay
+                    # Use same y0 targets as warm-up; only include base and flex purchase heads
+                    # Compute average anchor over this batch
+                    anchor_sum = torch.tensor(0.0)
+                    count = 0
+                    for idx, price_seq in enumerate(price_batch):
+                        global_idx = start + idx
+                        try:
+                            y0_tgt = float(base_y0_targets[global_idx])
+                            feats_b0 = build_driver_features(0, T, price_seq, time_batch[idx], month_batch[idx], forecast_batch[idx], 0.0, "base", S, 0, float(p_min), float(p_max))
+                            yb_all, yfp_all, _ = model(feats_b0, p_min=float(p_min), p_max=float(p_max))
+                            yb0 = yb_all[0]
+                            yfp0 = yfp_all[0]
+                            y0_tgt_t = torch.tensor(y0_tgt, dtype=torch.float32)
+                            anchor_sum = anchor_sum + (torch.abs(yb0 - y0_tgt_t) + torch.abs(yfp0 - y0_tgt_t))
+                            count += 1
+                        except Exception:
+                            pass
+                    anchor_term = (anchor_sum / max(1, count)) * anchor_w
+                else:
+                    anchor_term = torch.tensor(0.0)
+
+                loss = batch_total_loss + shape_penalty + topup_term + anchor_term
             losses.append(float(loss.item()))
             last_epoch_loss = float(loss.item())
 
@@ -1077,6 +1075,7 @@ try:
         "total_instances": total_instances,
         "trace": trace,
         "learning_rate": learning_rate,
+        "warmup_lr": args.warmup_lr,
     }
     def _fmt_vec_list(t):
         return "[" + ", ".join(f"{float(v):.6f}" for v in (t.detach().cpu().flatten().tolist())) + "]"

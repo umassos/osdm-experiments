@@ -20,6 +20,7 @@ import statistics
 from datetime import datetime  # run start time + tag
 from typing import List, Dict, Any
 import pickle
+import numpy as np
 import os
 
 try:
@@ -35,7 +36,7 @@ except Exception:
 # pald_model_CAISO_99_32_10030848 - no optimal random, robustness in the loop
 
 parser = argparse.ArgumentParser(description="Evaluate PALD-Contextual and PAAD over many instances.")
-parser.add_argument("--num_instances", type=int, default=1, help="Number of instances to evaluate (default: 1)")
+parser.add_argument("--num_instances", type=int, default=10, help="Number of instances to evaluate (default: 1)")
 parser.add_argument("--trace", type=str, default="CAISO", help="Trace name (default from file config)")
 parser.add_argument("--saved_model_dir", type=str, default="best_models_v1/", help="Directory with learned models (default: best_models_v1/)")
 parser.add_argument("--T", type=int, default=48, help="Time horizon (default: 48)")
@@ -45,7 +46,7 @@ parser.add_argument("--c_delivery", type=float, default=0.2, help="Delivery cost
 parser.add_argument("--eps_delivery", type=float, default=0.05, help="Delivery cost epsilon (default: 0.05)")
 parser.add_argument("--scale_factor", type=float, default=40.0, help="Scale factor for demands (default: 40.0)")
 parser.add_argument("--proportion_base", type=float, default=0.5, help="Proportion of base demand (default: 0.5)")
-parser.add_argument("--save_results", action="store_true", help="Save results to CSV")
+parser.add_argument("--eta", type=float, default=0.0, help="Tracking cost parameter eta (default: 0.0, no tracking cost)")
 args = parser.parse_args()
 
 model_device = torch.device("cpu")
@@ -134,20 +135,24 @@ def forward_pald(price_seq, time_seq, month_seq, forecast_seq, base_seq, flex_se
     storage_state = torch.tensor(0.0, dtype=torch.float32)
     x_prev_global = torch.tensor(0.0)
 
+    adjusted_S = min(sum(base_seq), 1.0)
+
+    # adjusted_S = (1.0) * (40.0/args.scale_factor)  # storage capacity in physical units 
+
     # Each base driver tracks fractional progress (unit capacity); demand scales the fractional decision
     base_drivers = []  # list of dicts with keys: id, b (demand), w (fraction), prev_decision (fraction)
     # Predict threshold for this base driver
     feats = build_driver_features(
         t_idx=0, T=T, price_seq=price_seq, time_seq=time_seq, month_seq=month_seq, forecast_seq=forecast_seq,
-        storage_state=S,
-        kind="base", b_or_f=S, delta_idx=T, p_min=float(p_min), p_max=float(p_max)
+        storage_state=0.0,
+        kind="base", b_or_f=adjusted_S, delta_idx=T, p_min=float(p_min), p_max=float(p_max)
     )
     y_vec_t, _, _ = model(feats, p_min=float(p_min), p_max=float(p_max))
     # log y_vec_t to the console
     # print(f"[debug] Initial base y_vec: {[float(v) for v in y_vec_t.detach().cpu()]}")
     base_drivers.append({
         "id": 0,
-        "b": S,
+        "b": adjusted_S,
         "w": torch.tensor(0.0, dtype=torch.float32).reshape(-1),
         "prev_decision": torch.tensor(0.0, dtype=torch.float32).reshape(-1),
         "y_vec": y_vec_t,
@@ -169,7 +174,7 @@ def forward_pald(price_seq, time_seq, month_seq, forecast_seq, base_seq, flex_se
         if f_arrival > 0:
             feats = build_driver_features(
                 t_idx=t, T=T, price_seq=price_seq, time_seq=time_seq, month_seq=month_seq, forecast_seq=forecast_seq,
-                storage_state=S,
+                storage_state=storage_state,
                 kind="flex", b_or_f=f_arrival, delta_idx=dlt, p_min=float(p_min), p_max=float(p_max)
             )
             _, y_vec_p, y_vec_d = model(feats, p_min=float(p_min), p_max=float(p_max))
@@ -188,18 +193,18 @@ def forward_pald(price_seq, time_seq, month_seq, forecast_seq, base_seq, flex_se
                 base_drivers = [] # reset previous base drivers
                 feats = build_driver_features(
                     t_idx=t, T=T, price_seq=price_seq, time_seq=time_seq, month_seq=month_seq, forecast_seq=forecast_seq,
-                    storage_state=S,
-                    kind="base", b_or_f=S, delta_idx=T, p_min=float(p_min), p_max=float(p_max)
+                    storage_state=0.0,
+                    kind="base", b_or_f=adjusted_S, delta_idx=T, p_min=float(p_min), p_max=float(p_max)
                 )
                 y_vec_t, _, _ = model(feats, p_min=float(p_min), p_max=float(p_max))
-                base_drivers.append({"id": 0, "b": S, 
+                base_drivers.append({"id": 0, "b": adjusted_S, 
                                         "w": torch.tensor(0.0, dtype=torch.float32).reshape(-1), 
                                         "prev_decision": torch.tensor(0.0, dtype=torch.float32).reshape(-1), "y_vec": y_vec_t})
             else:
                 # Predict threshold for this base driver
                 feats = build_driver_features(
                     t_idx=t, T=T, price_seq=price_seq, time_seq=time_seq, month_seq=month_seq, forecast_seq=forecast_seq,
-                    storage_state=S,
+                    storage_state=storage_state,
                     kind="base", b_or_f=b_t_val, delta_idx=T, p_min=float(p_min), p_max=float(p_max)
                 )
                 y_vec_t, _, _ = model(feats, p_min=float(p_min), p_max=float(p_max))
@@ -241,13 +246,10 @@ def forward_pald(price_seq, time_seq, month_seq, forecast_seq, base_seq, flex_se
             w_prev_frac = fd["w"]
 
             # Enforce deadline and purchase cap outside the layer (keeps DPP)
-            if t >= max(0, int(fd["delta"])-1):
+            if t == max(0, int(fd["delta"])-1):
                 # need to deliver remainder
                 cur_frac_z = torch.clamp(1.0 - v_prev_frac, min=0.0).reshape(-1)
-                # z_components.append(cur_frac_z)
-                # fd["prev_z"] = cur_frac_z.reshape(-1)
-                # fd["v"] = (fd["v"] + cur_frac_z).reshape(-1)
-                # continue
+                cur_phys_z = torch.mul(cur_frac_z, f_i).reshape(-1)
             # if w is really low, just force a zero decision
             if float(w_prev_frac.detach().item()) <= 1e-9:
                 # no more buying possible, force zero decision
@@ -392,15 +394,10 @@ def forward_pald(price_seq, time_seq, month_seq, forecast_seq, base_seq, flex_se
                 continue
 
             # Enforce deadline and purchase cap outside the layer (keeps DPP)
-            if t >= max(0, int(fd["delta"])-1):
+            if t == max(0, int(fd["delta"])-1):
                 # need to buy remainder
                 cur_frac_x = torch.clamp(1.0 - w_prev_frac, min=0.0).reshape(-1)
-                # decisions.append(cur_frac_x)
-                # fd["prev_x"] = cur_frac_x
-                # fd["w"] = (fd["w"] + fd["prev_x"]).reshape(-1)
-                # cur_phys_x = torch.mul(cur_frac_x, f_i).reshape(-1)
-                # buy_cap_t = buy_cap_t - cur_phys_x
-                # continue
+                cur_phys_x = torch.mul(cur_frac_x, f_i).reshape(-1)
             else:
                 # x_prev_clamped = max(0.0, min(1.0 - w_eff, float(pseudo_prev_x)))
 
@@ -442,7 +439,7 @@ def forward_pald(price_seq, time_seq, month_seq, forecast_seq, base_seq, flex_se
         # Ensure purchases cover deliveries (inventory feasibility)
         # storage_state is maintained as a torch scalar throughout
         if z_t - storage_state > x_t:
-            x_t = x_t + (z_t - storage_state - x_t)/2
+            x_t = x_t + (z_t - storage_state - x_t)
 
         # diagnostics -- check if the currect decision will ``overfill the storage''
         if float(storage_state.detach().item() + x_t.detach().item() - z_t.detach().item()) > S + 1e-3:
@@ -461,12 +458,12 @@ def forward_pald(price_seq, time_seq, month_seq, forecast_seq, base_seq, flex_se
             base_drivers = []  # reset previous base drivers
             feats = build_driver_features(
                 t_idx=t, T=T, price_seq=price_seq, time_seq=time_seq, month_seq=month_seq, forecast_seq=forecast_seq,
-                storage_state=S,
-                kind="base", b_or_f=S, delta_idx=T, p_min=float(p_min), p_max=float(p_max)
+                storage_state=adjusted_S,
+                kind="base", b_or_f=adjusted_S, delta_idx=T, p_min=float(p_min), p_max=float(p_max)
             )
             y_vec_t, _, _ = model(feats, p_min=float(p_min), p_max=float(p_max))
-            base_drivers.append({"id": 0, "b": S, 
-                                    "w": torch.tensor(0.0, dtype=torch.float32).reshape(-1), 
+            base_drivers.append({"id": 0, "b": adjusted_S,
+                                    "w": torch.tensor(0.0, dtype=torch.float32).reshape(-1),
                                     "prev_decision": torch.tensor(0.0, dtype=torch.float32).reshape(-1), "y_vec": y_vec_t})
         # storage_state already clamped    
         
@@ -478,7 +475,7 @@ def forward_pald(price_seq, time_seq, month_seq, forecast_seq, base_seq, flex_se
     x_torch = torch.stack(x_hist) if x_hist else torch.ones(T)
     z_torch = torch.stack(z_hist) if z_hist else torch.zeros(T)
 
-    return x_torch.detach().numpy(), z_torch.detach().numpy()
+    return x_torch.detach().numpy(), z_torch.detach().numpy(), float(storage_state.detach().item())
 
 def summarize(values: List[float]) -> Dict[str, float]:
     if not values:
@@ -530,9 +527,16 @@ def evaluate_many(price_all, times_all, months_all, forecast_all, base_all, flex
         D_seq = Delta_all[idx]
 
         # PALD-Fast
-        pald_x, pald_z = forward_pald(p_seq, times_seq, month_seq, forecast_seq, b_seq, f_seq, D_seq, model, p_min, p_max)
-        pald_cost = np_objective_function(T, p_seq, gamma, delta, c_delivery, eps_delivery, pald_x, pald_z)
-
+        pald_x, pald_z, storage_state = forward_pald(p_seq, times_seq, month_seq, forecast_seq, b_seq, f_seq, D_seq, model, p_min, p_max)
+        # compute avg price accepted by pald
+        min_price = min(p_seq) if p_seq else 0.0
+        # compute the price accepted by pald at the largest x_t
+        largest_x_idx = int(np.argmax(pald_x))
+        price_at_largest_x = p_seq[largest_x_idx] if largest_x_idx < len(p_seq) else min_price
+        last_price = p_seq[-1]
+        pald_cost = np_objective_function(T, p_seq, gamma, delta, c_delivery, eps_delivery, pald_x, pald_z) 
+        adjusted_pald_cost = pald_cost - storage_state * last_price - gamma*storage_state
+        
         # PAAD
         paad_res = pi.paad_algorithm(T, p_seq, gamma, delta,
                                      c_delivery, eps_delivery,
@@ -548,7 +552,7 @@ def evaluate_many(price_all, times_all, months_all, forecast_all, base_all, flex
 
         row = {
             "instance": idx,
-            "pald_cost": pald_cost,
+            "pald_cost": adjusted_pald_cost,
             "paad_cost": paad_cost,
             "pald_delivered": float(sum(pald_z)),
             "paad_delivered": float(sum(paad_z)),
@@ -585,6 +589,25 @@ def evaluate_many(price_all, times_all, months_all, forecast_all, base_all, flex
             else:
                 row["opt_cost"] = None
         rows.append(row)
+
+        # if the competitive ratio is very high, print the instance details for debugging
+        if "pald_over_opt" in row and row["pald_over_opt"] is not None and row["pald_over_opt"] > 2.0:
+            print(f"[warning] High PALD competitive ratio {row['pald_over_opt']:.2f} on instance {idx} (month {month})")
+            print(f"  Prices: {p_seq}")
+            print(f"  Base demands: {b_seq}")
+            print(f"  Flexible demands: {f_seq}")
+            print(f"  Deadlines: {D_seq}")
+            print(f"  PALD purchased: {float(sum(pald_x))}")
+            print(f"  PALD delivered: {float(sum(pald_z))}")
+            print(f"  PALD cost: {pald_cost}")
+            print(f"  PALD ratio of purchasing to delivery: {float(sum(pald_x)) / max(float(sum(pald_z)), 1e-6):.2f}")
+            print(f"  Adjusted PALD cost (storage credit): {adjusted_pald_cost}, storage left: {storage_state}")
+            print(f"  OPT purchased: {sum(results['x']) if 'results' in locals() and results else 'N/A'}")
+            print(f"  OPT delivered: {sum(results['z']) if 'results' in locals() and results else 'N/A'}")
+            if "opt_cost" in row and row["opt_cost"] is not None:
+                print(f"  OPT cost: {row['opt_cost']}, delivered: {row.get('opt_delivered', 'N/A')}")
+            else:
+                print("  OPT cost: N/A")
 
     # print_summary("Delivered PALD-Fast", pald_delivered)
     # print_summary("Delivered PAAD", paad_delivered)
@@ -659,9 +682,16 @@ def main():
     threshold_data = []
     for month in range(1, max_month + 1):
         price_all, base_all, flex_all, Delta_all, p_min, p_max = load_scenarios_with_flexible(
-            args.num_instances, T, args.trace, month=month, eval=True, scale_factor=scale_factor, proportion_base=proportion_base, saved=False
+            args.num_instances, T, args.trace, month=month, eval=True, scale_factor=scale_factor, proportion_base=proportion_base
         )
         print(f"Month {month}: Loaded {len(price_all)} instances with p_min={p_min}, p_max={p_max}")
+
+        tracking_target_all = [[0.0 for _ in seq] for seq in base_all]
+        if scale_factor != 40.0:
+            # rescale demands by the new scale factor (e.g., if scale factor = 80, divide all demands by 2)
+            divisor = scale_factor / 40.0
+            base_all = [[b / divisor for b in seq] for seq in base_all]
+            flex_all = [[f / divisor for f in seq] for seq in flex_all]
 
         # recover context about this particular set of instances
         times_all, months_all, forecast_all = recover_context_features(price_all, base_all, flex_all, Delta_all, p_min, p_max, month, T)
@@ -726,12 +756,13 @@ def main():
     print_summary("PAAD/OPT", ratios_paad)
 
     # Save detailed results to a pickle file
-    if args.save_results:
-        output_file = f'eval_results/{args.saved_model_dir}_{args.trace}_T{args.T}_gamma{args.gamma}_delta{args.delta}_c{args.c_delivery}_eps{args.eps_delivery}_prop{proportion_base}_scale{scale_factor}.pkl'
-        os.makedirs('eval_results', exist_ok=True)
-        with open(output_file, 'wb') as f:
-            pickle.dump(rows, f)
-        print(f"Saved detailed results to {output_file}")
+    # extract parameters for file name out of args.saved_model_dir
+    prefix = args.saved_model_dir.split('/')[0]
+    output_file = f'eval_results/{prefix}_{args.trace}_T{args.T}_gamma{args.gamma}_delta{args.delta}_c{args.c_delivery}_eps{args.eps_delivery}_prop{proportion_base}_scale{scale_factor}.pkl'
+    os.makedirs('eval_results', exist_ok=True)
+    with open(output_file, 'wb') as f:
+        pickle.dump(rows, f)
+    print(f"Saved detailed results to {output_file}")
 
     # plot CDF of the ratios
     try:
