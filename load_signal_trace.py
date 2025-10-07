@@ -71,19 +71,20 @@ def load_signal_trace(filename, month=1):
             df = df[df.index.month == month]
         # print the df.head
         # print(df.head())
+        # get the 99th percentile of the signal to avoid outliers
+        p_99 = df["lmp"].quantile(0.99).copy()
+        # cap the signal at the 99th percentile
+        df.loc[df['lmp'] > p_99, 'lmp'] = p_99
+        # if there are any negative prices, set them to one
+        df["lmp"][df["lmp"] < 1.0] = 1.0
         signal = df["lmp"]
         # if there are any negative prices, set them to one
         signal[signal < 1.0] = 1.0
+        p_min = signal.min()
+        p_max = signal.max()
 
     else:
         raise ValueError("Unknown signal type.")
-
-    p_min = signal.min()
-    # get the 99th percentile of the signal to avoid outliers
-    p_99 = signal.quantile(0.99).copy()
-    # cap the signal at the 99th percentile
-    signal.loc[signal > p_99] = p_99
-    p_max = signal.max()
 
     # extract the sequence of datetime indexes
     datetime_index = signal.index

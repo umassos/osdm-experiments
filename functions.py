@@ -77,7 +77,7 @@ def load_scenarios_with_flexible(num_scenarios, T, trace_name, proportion_base=0
     # if we don't already have scenarios pickled for this configuration, generate them
     # first check for a pickled file in demand_traces
     if saved:
-        pickle_filename = f"demand_traces/{trace_name}_month{month}_num{num_scenarios}_deadline{T}_prop{proportion_base}_scale{scale_factor}.pkl"
+        pickle_filename = f"demand_traces/{trace_name}_month{month}_num{num_scenarios}_deadline{T}_prop{proportion_base}.pkl"
         if eval:
             pickle_filename = f"eval_traces/{trace_name}_month{month}_num{num_scenarios}_deadline{T}_prop{proportion_base}_scale{scale_factor}.pkl"
         try:

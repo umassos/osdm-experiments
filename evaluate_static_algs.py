@@ -505,35 +505,42 @@ def main():
                 
         month_data.append((price_all, base_all, flex_all, Delta_all, tracking_target_all, p_min, p_max))
     
-      
-        print("Using learned thresholds.")
-        prefix = args.thres_file
-        # check if file exists
-        try:
-            # look for file named like best_thresholds_{trace}_{month}_{num_instances}_{timestamp}.pkl
-            candidate = f"best_thresholds_{args.trace}_{month}_{args.num_instances}"
-            # check if any file matches
-            import glob
-            files = glob.glob(f"best_thresholds/{candidate}*")
-            if not files:
-                print(f"No threshold file matching {candidate} found.")
-                return
-            # take the first match
-            filename = files[0]
-            print(f"Loading thresholds from {filename}...")
-            with open(filename, "rb") as f:
-                best_snapshot = pickle.load(f)
-                y_base = best_snapshot["y_base"]
-                y_flex_p = best_snapshot["y_flex_purchase"]
-                y_flex_d = best_snapshot["y_flex_delivery"]
-                if not (len(y_base) == K and len(y_flex_p) == K and len(y_flex_d) == K):
-                    print(f"Threshold lists in {filename} do not match K={K}.")
-                    return
-                
+        if args.analytical:
+            print("Using analytical thresholds.")
+            alpha = get_alpha(p_min, p_max, gamma, delta, c_delivery, eps_delivery, T)
+            y_base = [base_threshold((i + 0.5) / K, p_min, p_max, gamma, delta, c_delivery, eps_delivery, T, alpha) for i in range(K)]
+            y_flex_p = [flex_purchase_threshold((i + 0.5) / K, p_min, p_max, gamma, delta, c_delivery, eps_delivery, T, alpha) for i in range(K)]
+            y_flex_d = [flex_delivery_threshold((i + 0.5) / K, p_min, p_max, gamma, delta, c_delivery, eps_delivery, T, alpha) for i in range(K)]
             threshold_data.append((y_base, y_flex_p, y_flex_d))
-        except FileNotFoundError:
-            print(f"Threshold file {filename} not found.")
-            return
+        else:
+            print("Using learned thresholds.")
+            prefix = args.thres_file
+            # check if file exists
+            try:
+                # look for file named like best_thresholds_{trace}_{month}_{num_instances}_{timestamp}.pkl
+                candidate = f"best_thresholds_scalefactor_{scale_factor}_{args.trace}_{month}_{args.num_instances}"
+                # check if any file matches
+                import glob
+                files = glob.glob(f"best_thresholds/{candidate}*")
+                if not files:
+                    print(f"No threshold file matching {candidate} found.")
+                    return
+                # take the first match
+                filename = files[0]
+                print(f"Loading thresholds from {filename}...")
+                with open(filename, "rb") as f:
+                    best_snapshot = pickle.load(f)
+                    y_base = best_snapshot["y_base"]
+                    y_flex_p = best_snapshot["y_flex_purchase"]
+                    y_flex_d = best_snapshot["y_flex_delivery"]
+                    if not (len(y_base) == K and len(y_flex_p) == K and len(y_flex_d) == K):
+                        print(f"Threshold lists in {filename} do not match K={K}.")
+                        return
+                    
+                threshold_data.append((y_base, y_flex_p, y_flex_d))
+            except FileNotFoundError:
+                print(f"Threshold file {filename} not found.")
+                return
 
     rows = []
     for month in range(1, max_month + 1):
