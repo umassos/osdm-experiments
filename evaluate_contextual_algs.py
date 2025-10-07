@@ -33,7 +33,7 @@ except Exception:
 parser = argparse.ArgumentParser(description="Evaluate PALD-Contextual and PAAD over many instances.")
 parser.add_argument("--num_instances", type=int, default=100, help="Number of instances to evaluate (default: 1)")
 parser.add_argument("--trace", type=str, default="CAISO", help="Trace name (default from file config)")
-parser.add_argument("--saved_model_dir", type=str, default="best_models_v1/", help="Directory with learned models (default: best_models_v1/)")
+parser.add_argument("--saved_model_dir", type=str, default="best_models/", help="Directory with learned models (default: best_models/)")
 parser.add_argument("--T", type=int, default=48, help="Time horizon (default: 48)")
 parser.add_argument("--gamma", type=float, default=10.0, help="Gamma switching cost parameter (default: 10.0)")
 parser.add_argument("--delta", type=float, default=5.0, help="Delta switching cost parameter (default: 5.0)")
