@@ -22,6 +22,13 @@ from typing import List, Dict, Any
 import pickle
 import numpy as np
 import os
+import socket
+
+hostname = socket.gethostname()
+# use split on . to get the first part (before the dot)
+hostname_prefix = hostname.split('.')[0]
+# set pointer to license file
+os.environ['GRB_LICENSE_FILE'] = f"/nfs/obelix/users1/alechowicz/{hostname_prefix}.lic"
 
 try:
     import opt_sol  # offline optimal via Gurobi
@@ -578,25 +585,6 @@ def evaluate_many(price_all, times_all, months_all, forecast_all, base_all, flex
             else:
                 row["opt_cost"] = None
         rows.append(row)
-
-        # if the competitive ratio is very high, print the instance details for debugging
-        if "pald_over_opt" in row and row["pald_over_opt"] is not None and row["pald_over_opt"] > 2.0:
-            print(f"[warning] High PALD competitive ratio {row['pald_over_opt']:.2f} on instance {idx} (month {month})")
-            print(f"  Prices: {p_seq}")
-            print(f"  Base demands: {b_seq}")
-            print(f"  Flexible demands: {f_seq}")
-            print(f"  Deadlines: {D_seq}")
-            print(f"  PALD purchased: {float(sum(pald_x))}")
-            print(f"  PALD delivered: {float(sum(pald_z))}")
-            print(f"  PALD cost: {pald_cost}")
-            print(f"  PALD ratio of purchasing to delivery: {float(sum(pald_x)) / max(float(sum(pald_z)), 1e-6):.2f}")
-            print(f"  Adjusted PALD cost (storage credit): {adjusted_pald_cost}, storage left: {storage_state}")
-            print(f"  OPT purchased: {sum(results['x']) if 'results' in locals() and results else 'N/A'}")
-            print(f"  OPT delivered: {sum(results['z']) if 'results' in locals() and results else 'N/A'}")
-            if "opt_cost" in row and row["opt_cost"] is not None:
-                print(f"  OPT cost: {row['opt_cost']}, delivered: {row.get('opt_delivered', 'N/A')}")
-            else:
-                print("  OPT cost: N/A")
 
     return rows
 

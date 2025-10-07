@@ -13,6 +13,15 @@ import sys
 from tqdm import tqdm
 from load_signal_trace import load_signal_trace
 from functions import load_scenarios_with_flexible
+import socket
+import os
+
+hostname = socket.gethostname()
+# use split on . to get the first part (before the dot)
+hostname_prefix = hostname.split('.')[0]
+print("Hostname:", hostname, "Prefix:", hostname_prefix)
+# set pointer to license file
+os.environ['GRB_LICENSE_FILE'] = f"/nfs/obelix/users1/alechowicz/{hostname_prefix}.lic"
 
 np.set_printoptions(suppress=True,precision=3)
 
