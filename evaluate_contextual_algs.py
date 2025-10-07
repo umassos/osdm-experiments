@@ -523,14 +523,8 @@ def evaluate_many(price_all, times_all, months_all, forecast_all, base_all, flex
 
         # PALD-Fast
         pald_x, pald_z, storage_state = forward_pald(p_seq, times_seq, month_seq, forecast_seq, b_seq, f_seq, D_seq, model, p_min, p_max)
-        # compute avg price accepted by pald
-        min_price = min(p_seq) if p_seq else 0.0
-        # compute the price accepted by pald at the largest x_t
-        largest_x_idx = int(np.argmax(pald_x))
-        price_at_largest_x = p_seq[largest_x_idx] if largest_x_idx < len(p_seq) else min_price
         last_price = p_seq[-1]
-        pald_cost = np_objective_function(T, p_seq, gamma, delta, c_delivery, eps_delivery, pald_x, pald_z) 
-        adjusted_pald_cost = pald_cost - storage_state * last_price - gamma*storage_state
+        pald_cost = np_objective_function(T, p_seq, gamma, delta, c_delivery, eps_delivery, pald_x, pald_z) - storage_state * last_price - gamma*storage_state
         
         # PAAD
         paad_res = pi.paad_algorithm(T, p_seq, gamma, delta,
@@ -547,7 +541,7 @@ def evaluate_many(price_all, times_all, months_all, forecast_all, base_all, flex
 
         row = {
             "instance": idx,
-            "pald_cost": adjusted_pald_cost,
+            "pald_cost": pald_cost,
             "paad_cost": paad_cost,
             "pald_delivered": float(sum(pald_z)),
             "paad_delivered": float(sum(paad_z)),
@@ -603,11 +597,6 @@ def evaluate_many(price_all, times_all, months_all, forecast_all, base_all, flex
                 print(f"  OPT cost: {row['opt_cost']}, delivered: {row.get('opt_delivered', 'N/A')}")
             else:
                 print("  OPT cost: N/A")
-
-    # print_summary("Delivered PALD-Fast", pald_delivered)
-    # print_summary("Delivered PAAD", paad_delivered)
-    # if opt_delivered:
-    #     print_summary("Delivered OPT", opt_delivered)
 
     return rows
 
@@ -690,16 +679,6 @@ def main():
 
         # recover context about this particular set of instances
         times_all, months_all, forecast_all = recover_context_features(price_all, base_all, flex_all, Delta_all, p_min, p_max, month, T)
-
-        # print all information about the first instance for debugging
-        # print(f"First instance details for month {month}:")
-        # print(f"  Prices: {price_all[0]}")
-        # print(f"  Base demands: {base_all[0]}")
-        # print(f"  Flexible demands: {flex_all[0]}")
-        # print(f"  Deadlines: {Delta_all[0]}")
-        # print(f"  Times: {times_all[0]}")
-        # print(f"  Month: {months_all[0]}")
-        # print(f"  Forecast: {forecast_all[0]}")
 
         month_data.append((price_all, times_all, months_all, forecast_all, base_all, flex_all, Delta_all, p_min, p_max))
     
