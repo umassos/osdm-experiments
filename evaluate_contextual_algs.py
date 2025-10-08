@@ -534,13 +534,17 @@ def evaluate_many(price_all, times_all, months_all, forecast_all, base_all, flex
         pald_cost = np_objective_function(T, p_seq, gamma, delta, c_delivery, eps_delivery, pald_x, pald_z) - storage_state * last_price - gamma*storage_state
         
         # PAAD
-        paad_res = pi.paad_algorithm(T, p_seq, gamma, delta,
-                                     c_delivery, eps_delivery,
-                                     p_min, p_max, S, b_seq, f_seq, D_seq)
-        paad_x = paad_res["x"]
-        paad_z = paad_res["z"]
-        paad_cost = np_objective_function(T, p_seq, gamma, delta, c_delivery, eps_delivery, paad_x, paad_z)
+        # paad_res = pi.paad_algorithm(T, p_seq, gamma, delta,
+        #                              c_delivery, eps_delivery,
+        #                              p_min, p_max, S, b_seq, f_seq, D_seq)
+        # paad_x = paad_res["x"]
+        # paad_z = paad_res["z"]
+        # paad_cost = np_objective_function(T, p_seq, gamma, delta, c_delivery, eps_delivery, paad_x, paad_z)
 
+        # dummy values for PAAD since we don't need to run it twice
+        paad_x, paad_z = pald_x, pald_z
+        paad_cost = pald_cost
+        
         pald_costs.append(pald_cost)
         paad_costs.append(paad_cost)
         pald_delivered.append(float(sum(pald_z)))

@@ -3,23 +3,24 @@ import os
 import argparse
 import torch.optim as optim
 from functions import load_scenarios_with_flexible
-from pald_static_implementation import (
+from pald_static_implementation_tracking import (
     make_pald_base_layer,
     make_pald_flex_purchase_layer,
     make_pald_flex_delivery_layer,
 )
-from paad_implementation import get_alpha
-from robust_projection import project_y_robust, project_y_flex_robust
-import paad_implementation as pi
+from paad_tracking_implementation import get_alpha
+from robust_projection_tracking import project_y_robust, project_y_flex_robust
+import paad_tracking_implementation as pi
 import math
-from paad_implementation import objective_function as np_objective_function
+from paad_tracking_implementation import objective_function as np_objective_function
 import cvxpy as cp
 import pickle
 import opt_sol
 from tqdm import tqdm
 from datetime import datetime  # [ADD] run start time + tag
+import numpy as np
 
-torch.set_num_threads(os.cpu_count() or 4)
+torch.set_num_threads(2)
 
 # [ADD] Capture run start time/tag and a list of generated files
 run_start_dt = datetime.now()
@@ -36,18 +37,18 @@ parser.add_argument('--num_batches', type=int, default=1, help='Number of batche
 parser.add_argument('--use_cost_loss', action='store_true', help='Use total cost loss instead of competitive-ratio loss')
 parser.add_argument('--pretraining_loop', type=int, default=200, help='Number of epochs to pretrain with random thresholds (default: 200)')
 parser.add_argument('--trace', type=str, default="CAISO", help='Trace name to use (default: CAISO)')
-parser.add_argument('--scale_factor', type=float, default=640.0, help='Scale factor for demands (default: 40.0)')
+parser.add_argument('--scale_factor', type=float, default=40.0, help='Scale factor for demands (default: 40.0)')
 parser.add_argument('--month', type=int, default=1, help='Month to filter for in trace (default: 1, 99 for all)')
 args = parser.parse_args()
 
 K = 10           # number of segments in piecewise linear approximation for psi
-gamma = 10.0     # switching cost parameter for x
+eta = 10.0     # tracking cost parameter for x
 delta = 5.0     # switching cost parameter for z (used in analytical threshold)
 S = 1.0          # maximum inventory capacity
 T = 48          # 12 hours in 15-minute intervals
 c_delivery = 0.2
 eps_delivery = 0.05
-epochs = 210
+epochs = 500
 # get batch size from command line 
 batch_size = args.batch_size
 # get length of pretraining loop from command line
@@ -66,6 +67,28 @@ learning_rate = 0.1
 # Prefetch all scenarios for all batches (e.g., 25 * 100 = 2500)
 total_instances = batch_size * num_batches
 price_all, base_all, flex_all, Delta_all, p_min, p_max = load_scenarios_with_flexible(total_instances, T, trace, month=month)
+tracking_target_all = [[0.0 for _ in seq] for seq in base_all]
+for i in range(len(base_all)):
+    # set tracking targets to be the total demand (base + flex) evenly spread over T slots
+    total_demand = sum(base_all[i]) + sum(flex_all[i])
+    even_target = total_demand / T
+    tracking_target_all[i] = [even_target for _ in range(T)]
+    # choose random time slots to have zero target -- probability weighted by the price (higher price, higher chance of zero target)
+    price_seq = np.array(price_all[i])
+    probs = price_seq / np.sum(price_seq)
+    rng = np.random.default_rng(42)
+    # choose a random number of indexes to pick: 2, 3, or 4
+    num_indexes = rng.choice([2, 3, 4])
+    chosen_indexes = rng.choice(int(T), size=num_indexes, replace=False, p=probs)
+    reallocation = 0.0
+    for idx in chosen_indexes:
+        reallocation += tracking_target_all[i][idx]
+        tracking_target_all[i][idx] = 0.0
+    # reallocate the removed target evenly to other slots
+    reallocation_per_slot = reallocation / (T - num_indexes)
+    for t in range(T):
+        if t not in chosen_indexes:
+            tracking_target_all[i][t] += reallocation_per_slot
 
 if scale_factor != 40.0:
     # rescale demands by the new scale factor (e.g., if scale factor = 80, divide all demands by 2)
@@ -78,15 +101,15 @@ all_prices_flat = [price for seq in price_all for price in seq]
 price_min = min(all_prices_flat) if all_prices_flat else float('inf')
 price_max = max(all_prices_flat) if all_prices_flat else float('-inf')
 
-alpha = float(get_alpha(float(p_min), float(p_max), c_delivery, eps_delivery, 96, gamma, delta))
+alpha = float(get_alpha(float(p_min), float(p_max), c_delivery, eps_delivery, 96, eta, delta))
 print(f"Computed alpha for analytical thresholds: {alpha}")
 beta = 100
 
 # ---------------------------------------
 # Precompute OPT costs for competitive-ratio loss
 # ---------------------------------------
-def precompute_opt_costs_flex(price_instances, base_instances, flex_instances, Delta_instances,
-                              T, gamma, delta, c, eps, S):
+def precompute_opt_costs_tracking(price_instances, base_instances, flex_instances, Delta_instances, tracking_target_all,
+                              T, eta, delta, c, eps, S):
     """
     Returns a list (len = total_instances) of OPT objective values (floats) or None per instance.
     """
@@ -99,10 +122,10 @@ def precompute_opt_costs_flex(price_instances, base_instances, flex_instances, D
         total_demand = sum(b_seq) + sum(f_seq)
         total_demands.append(total_demand)
 
-    if os.path.exists(f"opt_sols/opt_costs_flex_{trace}_{month}_{total_instances}.pkl"):
-        with open(f"opt_sols/opt_costs_flex_{trace}_{month}_{total_instances}.pkl", "rb") as f:
+    if os.path.exists(f"opt_sols/opt_costs_tracking_{trace}_{month}_{total_instances}.pkl"):
+        with open(f"opt_sols/opt_costs_tracking_{trace}_{month}_{total_instances}.pkl", "rb") as f:
             opt_costs, total_demands_saved = pickle.load(f)
-        print(f"Loaded precomputed OPT costs for flexible demand from opt_sols/opt_costs_flex_{trace}_{month}_{total_instances}.pkl")
+        print(f"Loaded precomputed OPT costs for tracking from opt_sols/opt_costs_tracking_{trace}_{month}_{total_instances}.pkl")
 
         # verify that the saved total demands match
         if total_demands != total_demands_saved:
@@ -112,44 +135,45 @@ def precompute_opt_costs_flex(price_instances, base_instances, flex_instances, D
             return opt_costs, total_demands
 
     # use TQDM for progress bar
-    for p_seq, b_seq, f_seq, dlt in tqdm(zip(price_instances, base_instances, flex_instances, Delta_instances)):
+    for p_seq, b_seq, f_seq, dlt, a_seq in tqdm(zip(price_instances, base_instances, flex_instances, Delta_instances, tracking_target_all)):
         try:
-            status, results = opt_sol.optimal_solution(T, p_seq, gamma, delta, c, eps, S, b_seq, f_seq, dlt)
+            status, results = opt_sol.optimal_tracking_solution(T, p_seq, eta, delta, c, eps, S, b_seq, f_seq, dlt, a_seq)
             if status == "Optimal" and results is not None:
-                opt_cost = np_objective_function(T, p_seq, gamma, delta, c, eps, results['x'], results['z'])
+                opt_cost = np_objective_function(T, p_seq, eta, delta, c, eps, results['x'], results['z'], a_seq)
             else:
                 opt_cost = None
-        except Exception:
+        except Exception as e:
+            print(f"Exception during OPT computation: {e}")
             opt_cost = None
         opt_costs.append(opt_cost)
     
     # save the computed OPT costs for future use
     # first ensure the directory exists
     os.makedirs("opt_sols", exist_ok=True)
-    with open(f"opt_sols/opt_costs_flex_{trace}_{month}_{total_instances}.pkl", "wb") as f:
+    with open(f"opt_sols/opt_costs_tracking_{trace}_{month}_{total_instances}.pkl", "wb") as f:
         pickle.dump((opt_costs, total_demands), f)
     
     return opt_costs, total_demands
 
 print("Precomputing OPT costs for competitive-ratio loss...")
-opt_costs_all, total_demands_all = precompute_opt_costs_flex(price_all, base_all, flex_all, Delta_all, T, gamma, delta, c_delivery, eps_delivery, S)
+opt_costs_all, total_demands_all = precompute_opt_costs_tracking(price_all, base_all, flex_all, Delta_all, tracking_target_all, T, eta, delta, c_delivery, eps_delivery, S)
 num_opt_ok = sum(1 for v in (opt_costs_all or []) if (v is not None and v > 1e-6))
 print(f"OPT costs available for {num_opt_ok}/{total_instances} instances.")
 
 # exit(0)
 
 # Keep analytical threshold utilities for plotting comparison
-def base_threshold(w: float, p_min: float, p_max: float, gamma: float, delta: float, c: float, eps: float, T: int, alpha: float, b: float = 1.0) -> float:
-    lhs = p_max + 2.0 * gamma + p_min * c
-    inside_exp = (p_max * (1.0 + c + eps) + 2.0 * (gamma + delta)) / alpha - (p_max * (1.0 + eps) + p_min * c + 2.0 * (gamma + delta) / T)
+def base_threshold(w: float, p_min: float, p_max: float, eta: float, delta: float, c: float, eps: float, T: int, alpha: float, b: float = 1.0) -> float:
+    lhs = p_max + 2.0 * eta + p_min * c
+    inside_exp = (p_max * (1.0 + c + eps) + 2.0 * (eta + delta)) / alpha - (p_max * (1.0 + eps) + p_min * c + 2.0 * (delta) / T)
     return lhs + inside_exp * math.exp(w / (alpha * max(b, 1e-8)))
-def flex_purchase_threshold(w: float, p_min: float, p_max: float, gamma: float, delta: float, c: float, eps: float, T: int, alpha: float, f: float = 1.0) -> float:
+def flex_purchase_threshold(w: float, p_min: float, p_max: float, eta: float, delta: float, c: float, eps: float, T: int, alpha: float, f: float = 1.0) -> float:
     alpha_p = alpha * (1.0 + eps) / (1.0 + c + eps)
     omega = (1.0 + c + eps) / (1.0 + eps)
-    lhs = p_max + 2.0 * gamma + p_min * c
-    inside = (p_max + 2.0 * gamma) / alpha_p - (p_max + p_min * c + (2.0 * gamma / T) * omega)
+    lhs = p_max + 2.0 * eta + p_min * c
+    inside = (p_max + 2.0 * eta) / alpha_p - (p_max + p_min * c)
     return lhs + inside * math.exp(w / (alpha_p * max(f, 1e-8)))
-def flex_delivery_threshold(v: float, p_min: float, p_max: float, gamma: float, delta: float, c: float, eps: float, T: int, alpha: float, f: float = 1.0) -> float:
+def flex_delivery_threshold(v: float, p_min: float, p_max: float, eta: float, delta: float, c: float, eps: float, T: int, alpha: float, f: float = 1.0) -> float:
     alpha_p = alpha * (1.0 + eps) / (1.0 + c + eps)
     omega = (1.0 + c + eps) / (1.0 + eps)
     lhs = p_max * (c + eps) + 2.0 * delta
@@ -160,21 +184,21 @@ def flex_delivery_threshold(v: float, p_min: float, p_max: float, gamma: float, 
 w_grid = [(i + 0.5) / K for i in range(K)]
 
 # Base threshold init (monotone, tail pin)
-y_init_base = [base_threshold(w, float(p_min), float(p_max), gamma, delta, c_delivery, eps_delivery, T, alpha, b=1.0) for w in w_grid]
+y_init_base = [base_threshold(w, float(p_min), float(p_max), eta, delta, c_delivery, eps_delivery, T, alpha, b=1.0) for w in w_grid]
 for i in range(1, K):
     y_init_base[i] = min(y_init_base[i], y_init_base[i-1])
 if K > 0:
-    y_init_base[-1] = float(p_min) + 2.0 * gamma
+    y_init_base[-1] = float(p_min) + 2.0 * eta
 
 # Flexible purchase threshold init
-y_init_flex_p = [flex_purchase_threshold(w, float(p_min), float(p_max), gamma, delta, c_delivery, eps_delivery, T, alpha, f=1.0) for w in w_grid]
+y_init_flex_p = [flex_purchase_threshold(w, float(p_min), float(p_max), eta, delta, c_delivery, eps_delivery, T, alpha, f=1.0) for w in w_grid]
 for i in range(1, K):
     y_init_flex_p[i] = min(y_init_flex_p[i], y_init_flex_p[i-1])
 if K > 0:
-    y_init_flex_p[-1] = float(p_min) + 2.0 * gamma
+    y_init_flex_p[-1] = float(p_min) + 2.0 * eta
 
 # Flexible delivery threshold init
-y_init_flex_d = [flex_delivery_threshold(v, float(p_min), float(p_max), gamma, delta, c_delivery, eps_delivery, T, alpha, f=1.0) for v in w_grid]
+y_init_flex_d = [flex_delivery_threshold(v, float(p_min), float(p_max), eta, delta, c_delivery, eps_delivery, T, alpha, f=1.0) for v in w_grid]
 for i in range(1, K):
     y_init_flex_d[i] = min(y_init_flex_d[i], y_init_flex_d[i-1])
 if K > 0:
@@ -186,8 +210,8 @@ y_flex_p = torch.nn.Parameter(torch.tensor(y_init_flex_p, dtype=torch.float32)) 
 y_flex_d = torch.nn.Parameter(torch.tensor(y_init_flex_d, dtype=torch.float32))  # flexible delivery threshold
 
 
-pald_base_layer = make_pald_base_layer(K, gamma)
-pald_flex_purchase_layer = make_pald_flex_purchase_layer(K, gamma)
+pald_base_layer = make_pald_base_layer(K, eta)
+pald_flex_purchase_layer = make_pald_flex_purchase_layer(K, eta)
 pald_flex_delivery_layer = make_pald_flex_delivery_layer(K, delta, c_delivery, eps_delivery)
 # optimizer = optim.Adam([y, y_flex_p, y_flex_d], lr=learning_rate)
 # use SGD instead
@@ -216,7 +240,7 @@ def compute_segment_caps(w_prev: float, K: int):
         caps.append(cap)
     return caps
 
-def torch_objective(p_seq, x_seq, z_seq, gamma, delta, c, eps):
+def torch_objective(p_seq, a_seq, x_seq, z_seq, eta, delta, c, eps):
     """Torch version of objective_function for differentiable PALD cost.
     Inputs are torch 1D tensors of length T (float32).
     Mirrors paad_implementation.objective_function.
@@ -234,29 +258,12 @@ def torch_objective(p_seq, x_seq, z_seq, gamma, delta, c, eps):
 
     # Costs
     cost_purchasing = (p_seq * x_seq).sum()
-    switching_cost_x = gamma * (x_seq[1:] - x_seq[:-1]).abs().sum() if Tn > 1 else torch.tensor(0.0)
+    tracking_cost_x = eta * (x_seq - a_seq).abs().sum() if Tn > 1 else torch.tensor(0.0)
     switching_cost_z = delta * (z_seq[1:] - z_seq[:-1]).abs().sum() if Tn > 1 else torch.tensor(0.0)
     # Note: s_{t-1} term via roll(1); s_{-1} uses previous s_T but is unused because multiplied with z[0]; fix first index:
     s_prev_seq = torch.cat([s_torch[:-1]])
     discharge_cost = (p_seq * (c * z_seq + eps * z_seq - c * s_prev_seq * z_seq)).sum()
-    return cost_purchasing + switching_cost_x + switching_cost_z + discharge_cost
-
-def precompute_opt_costs(price_instances, demand_instances, T, gamma, delta, c, eps, S):
-    opt_costs = []
-    for p_seq, b_seq in zip(price_instances, demand_instances):
-        f = [0.0 for _ in range(T)]
-        Delta_f = [0 for _ in range(T)]
-        try:
-            status, results = opt_sol.optimal_solution(T, p_seq, gamma, delta, c, eps, S, b_seq, f, Delta_f)
-            if status == "Optimal" and results is not None:
-                # Compute objective via numpy function to ensure consistency
-                opt_cost = np_objective_function(T, p_seq, gamma, delta, c, eps, results['x'], results['z'])
-            else:
-                opt_cost = None
-        except Exception:
-            opt_cost = None
-        opt_costs.append(opt_cost)
-    return opt_costs
+    return cost_purchasing + tracking_cost_x + switching_cost_z + discharge_cost
 
 def _safe_layer_call(layer, args, size=1.0):
     """
@@ -281,12 +288,12 @@ try:
                 price_seq = price_batch[0]
                 y_random = torch.rand(K) * (float(p_max) - float(p_min)) + float(p_min)
                 y_random, _ = torch.sort(y_random, descending=True)
-                # y_random[-1] = float(p_min) + 2.0 * float(gamma)
+                # y_random[-1] = float(p_min) + 2.0 * float(eta)
                 y.copy_(y_random)
 
                 y_flex_p_random = torch.rand(K) * (float(p_max) - float(p_min)) + float(p_min)
                 y_flex_p_random, _ = torch.sort(y_flex_p_random, descending=True)
-                # y_flex_p_random[-1] = float(p_min) + 2.0 * float(gamma)
+                # y_flex_p_random[-1] = float(p_min) + 2.0 * float(eta)
                 y_flex_p.copy_(y_flex_p_random)
 
                 y_flex_d_random = torch.rand(K) * (float(p_max) * (c_delivery + eps_delivery) - float(p_min) * (c_delivery + eps_delivery)) + float(p_min) * (c_delivery + eps_delivery)
@@ -295,16 +302,16 @@ try:
                 y_flex_d.copy_(y_flex_d_random)
 
                 # project to ensure robustness
-                y_proj = project_y_robust(y, K, float(p_min), float(p_max), float(gamma), float(delta), float(c_delivery), float(eps_delivery), int(T), beta=beta)
+                y_proj = project_y_robust(y, K, float(p_min), float(p_max), float(eta), float(delta), float(c_delivery), float(eps_delivery), int(T), beta=beta)
                 if y_proj is not None:
                     for i in range(K):
                         y[i] = torch.tensor(float(y_proj[i]))
                 if K > 0:
-                    y[-1] = torch.tensor(float(p_min) + 2.0 * gamma)
+                    y[-1] = torch.tensor(float(p_min) + 2.0 * eta)
                 phi_proj, psi_proj = project_y_flex_robust(
                     y_flex_p, y_flex_d, K,
                     float(p_min), float(p_max),
-                    float(gamma), float(delta),
+                    float(eta), float(delta),
                     float(c_delivery), float(eps_delivery),
                     int(T), beta=beta
                 )
@@ -337,9 +344,10 @@ try:
             base_batch = base_all[start:end]
             flex_batch = flex_all[start:end]
             Delta_batch = Delta_all[start:end]
+            tracking_batch = tracking_target_all[start:end]
             batch_total_loss = torch.tensor(0.0)
             # Iterate instances in this batch
-            for idx, (price_seq, base_seq, flex_seq, Delta_seq) in enumerate(zip(price_batch, base_batch, flex_batch, Delta_batch)):
+            for idx, (price_seq, base_seq, flex_seq, Delta_seq, tracking_seq) in enumerate(zip(price_batch, base_batch, flex_batch, Delta_batch, tracking_batch)):
                 global_idx = start + idx  # align with precomputed OPT list
                 # global storage state in physical units
                 storage_state = 0.0
@@ -358,6 +366,7 @@ try:
                 for t in range(T):
                     b_t_val = float(base_seq[t])
                     p_t_val = float(price_seq[t])
+                    a_t_val = float(tracking_seq[t])
                     # Add flexible driver arrivals
                     f_arrival = float(flex_seq[t])
                     dlt = int(Delta_seq[t])
@@ -407,12 +416,13 @@ try:
                         # Call CVX layer with full y vector and caps (all tensors)
                         x_prev_frac_t = torch.tensor(float(pseudo_prev_frac), dtype=torch.float32)
                         w_prev_frac_t = torch.tensor(w_eff, dtype=torch.float32)
+                        a_t_t = torch.tensor(a_t_val, dtype=torch.float32)
                         p_t_t = torch.tensor(p_t_val, dtype=torch.float32)
                         y_vec_t = y
                         caps_t = torch.tensor(caps_list, dtype=torch.float32)
 
                         cur_frac_decision = _safe_layer_call(
-                            pald_base_layer, (x_prev_frac_t, w_prev_frac_t, p_t_t, y_vec_t, caps_t), size=(1.0 - w_eff)
+                            pald_base_layer, (a_t_t, w_prev_frac_t, p_t_t, y_vec_t, caps_t), size=(1.0 - w_eff)
                         )
 
                         # Convert to physical units by scaling with demand of this driver
@@ -449,12 +459,13 @@ try:
                             x_prev_clamped = max(0.0, min(1.0 - w_eff, float(pseudo_prev_x)))
                             x_prev_frac_t = torch.tensor(x_prev_clamped, dtype=torch.float32)
                             w_prev_frac_t = torch.tensor(w_eff, dtype=torch.float32)
+                            a_t_t = torch.tensor(a_t_val, dtype=torch.float32)
                             p_t_t = torch.tensor(p_t_val, dtype=torch.float32)
                             y_vec_t = y_flex_p
                             caps_t = torch.tensor(caps_list, dtype=torch.float32)
 
                             cur_frac_x = _safe_layer_call(
-                                pald_flex_purchase_layer, (x_prev_frac_t, w_prev_frac_t, p_t_t, y_vec_t, caps_t), size=(1.0 - w_eff)
+                                pald_flex_purchase_layer, (a_t_t, w_prev_frac_t, p_t_t, y_vec_t, caps_t), size=(1.0 - w_eff)
                             )
                         cur_phys_x = torch.mul(cur_frac_x, f_i)
                         decisions.append(cur_phys_x)
@@ -522,7 +533,7 @@ try:
                     x_t = torch.clamp(x_t, min=torch.tensor(0.0, dtype=torch.float32))
                     storage_state = float(storage_state + float(x_t.detach()) - float(z_t.detach()))
 
-                    inst_cost = inst_cost + p_t_t * x_t + gamma * torch.abs(x_t - x_prev_global)
+                    inst_cost = inst_cost + p_t_t * x_t + eta * torch.abs(x_t - x_prev_global)
                     x_prev_global = x_t.detach()
 
                     # record sequences for torch objective
@@ -531,10 +542,11 @@ try:
 
                 # Convert sequences for torch objective
                 p_torch = torch.tensor([float(v) for v in price_seq], dtype=torch.float32)
+                a_torch = torch.tensor([float(v) for v in tracking_seq], dtype=torch.float32)
                 x_torch = torch.stack(x_hist) if x_hist else torch.ones(T)
                 z_torch = torch.stack(z_hist) if z_hist else torch.zeros(T)
 
-                pald_cost = torch_objective(p_torch, x_torch, z_torch, gamma, delta, c_delivery, eps_delivery)
+                pald_cost = torch_objective(p_torch, a_torch, x_torch, z_torch, eta, delta, c_delivery, eps_delivery)
 
                 if not use_cost_loss:
                     # # Competitive-ratio loss: ReLU(pald/opt - 1), opt treated as constant
@@ -554,7 +566,7 @@ try:
                     # print(" pald cost: ", pald_cost.item(), " opt cost: ", None if opt_costs_all is None else opt_costs_all[global_idx], " inst loss: ", inst_loss.item())
 
                     # # check that the torch_objective matches the np_objective_function
-                    # np_cost = np_objective_function(T, [float(v) for v in price_seq], gamma, delta, c_delivery, eps_delivery, [float(v.detach()) for v in x_torch], [float(v.detach()) for v in z_torch])
+                    # np_cost = np_objective_function(T, [float(v) for v in price_seq], eta, delta, c_delivery, eps_delivery, [float(v.detach()) for v in x_torch], [float(v.detach()) for v in z_torch])
                     # print(" np cost: ", np_cost, " pald cost: ", pald_cost.item())
 
                 else:
@@ -584,16 +596,16 @@ try:
 
                 # Project y onto robustness sets every 10 epochs
                 with torch.no_grad():
-                    y_proj = project_y_robust(y, K, float(p_min), float(p_max), float(gamma), float(delta), float(c_delivery), float(eps_delivery), int(T), beta=beta)
+                    y_proj = project_y_robust(y, K, float(p_min), float(p_max), float(eta), float(delta), float(c_delivery), float(eps_delivery), int(T), beta=beta)
                     if y_proj is not None:
                         for i in range(K):
                             y[i] = torch.tensor(float(y_proj[i]))
                     if K > 0:
-                        y[-1] = torch.tensor(float(p_min) + 2.0 * gamma)
+                        y[-1] = torch.tensor(float(p_min) + 2.0 * eta)
                     phi_proj, psi_proj = project_y_flex_robust(
                         y_flex_p, y_flex_d, K,
                         float(p_min), float(p_max),
-                        float(gamma), float(delta),
+                        float(eta), float(delta),
                         float(c_delivery), float(eps_delivery),
                         int(T), beta=beta
                     )
@@ -654,7 +666,7 @@ with torch.no_grad():
         # [CHG] Save tagged best-thresholds file
         os.makedirs("best_thresholds", exist_ok=True)
         import pickle
-        best_outfile = f"best_thresholds/best_thresholds_scalefactor_{scale_factor}_{trace}_{month}_{batch_size}_{run_tag}.pkl"
+        best_outfile = f"best_thresholds/TRACKING_thresholds_scalefactor_{scale_factor}_{trace}_{month}_{batch_size}_{run_tag}.pkl"
         with open(best_outfile, 'wb') as f:
             pickle.dump({
                 'y_base': y.detach().cpu().numpy().tolist(),
@@ -681,7 +693,7 @@ with torch.no_grad():
 # -------------------------
 # Forward PALD with given thresholds
 # -------------------------
-def forward_pald(price_seq, base_seq, flex_seq, Delta_seq):
+def forward_pald(price_seq, base_seq, flex_seq, Delta_seq, tracking_seq):
     x_list, z_list, s_list = [], [], []
     storage_state = 0.0
     x_prev_global = torch.tensor(0.0)
@@ -697,6 +709,7 @@ def forward_pald(price_seq, base_seq, flex_seq, Delta_seq):
         for t in range(T):
             b_t_val = float(base_seq[t])
             p_t_val = float(price_seq[t])
+            a_t_val = float(tracking_seq[t])
             # arrivals
             if b_t_val > 0:
                 base_drivers.append({"id": 2 * t + 2, "b": b_t_val, "w": 0.0, "prev_decision": 0.0})
@@ -726,9 +739,10 @@ def forward_pald(price_seq, base_seq, flex_seq, Delta_seq):
                     x_prev_frac_t = torch.tensor(x_prev_clamped, dtype=torch.float32)
                     w_prev_frac_t = torch.tensor(w_eff, dtype=torch.float32)
                     p_t_t = torch.tensor(p_t_val, dtype=torch.float32)
+                    a_t_t = torch.tensor(a_t_val, dtype=torch.float32)
                     caps_t = torch.tensor(caps_list, dtype=torch.float32)
                     cur_frac_decision = _safe_layer_call(
-                        pald_base_layer, (x_prev_frac_t, w_prev_frac_t, p_t_t, y, caps_t), size=(1.0 - w_eff)
+                        pald_base_layer, (a_t_t, w_prev_frac_t, p_t_t, y, caps_t), size=(1.0 - w_eff)
                     )
                 cur_phys_decision = float(cur_frac_decision.item() * b_i)
                 decisions.append(cur_phys_decision)
@@ -752,9 +766,10 @@ def forward_pald(price_seq, base_seq, flex_seq, Delta_seq):
                     x_prev_frac_t = torch.tensor(x_prev_clamped, dtype=torch.float32)
                     w_prev_frac_t = torch.tensor(w_eff, dtype=torch.float32)
                     p_t_t = torch.tensor(p_t_val, dtype=torch.float32)
+                    a_t_t = torch.tensor(a_t_val, dtype=torch.float32)
                     caps_t = torch.tensor(caps_list, dtype=torch.float32)
                     cur_frac_x = _safe_layer_call(
-                        pald_flex_purchase_layer, (x_prev_frac_t, w_prev_frac_t, p_t_t, yp, caps_t), size=(1.0 - w_eff)
+                        pald_flex_purchase_layer, (a_t_t, w_prev_frac_t, p_t_t, y, caps_t), size=(1.0 - w_eff)
                     )
                 cur_phys_x = float(cur_frac_x.item() * f_i)
                 decisions.append(cur_phys_x)
@@ -850,12 +865,13 @@ def evaluate_and_plot_instance0(prefix: str = 'eval_instance0'):
     b0 = base_all[0]
     f0 = flex_all[0]
     Delta0 = Delta_all[0]
+    tracking0 = tracking_target_all[0]
 
     # PALD forward pass with learned y
-    pald_x, pald_z, pald_s = forward_pald(p0, b0, f0, Delta0)
+    pald_x, pald_z, pald_s = forward_pald(p0, b0, f0, Delta0, tracking0)
 
     # PAAD baseline
-    paad_res = pi.paad_algorithm(T, p0, gamma, delta, c_delivery, eps_delivery, p_min, p_max, S, b0, f0, Delta0)
+    paad_res = pi.paad_algorithm(T, p0, eta, delta, c_delivery, eps_delivery, p_min, p_max, S, b0, f0, Delta0, tracking0)
     paad_x = paad_res['x']
     paad_z = paad_res['z']
     paad_s = paad_res['s'][1:]  # drop initial
@@ -864,13 +880,13 @@ def evaluate_and_plot_instance0(prefix: str = 'eval_instance0'):
     opt_x = opt_z = opt_s = None
     opt_cost = None
     try:
-        status, results = opt_sol.optimal_solution(T, p0, gamma, delta, c_delivery, eps_delivery, S, b0, f0, Delta0)
+        status, results = opt_sol.optimal_tracking_solution(T, p0, eta, delta, c_delivery, eps_delivery, S, b0, f0, Delta0, tracking0)
         if status == "Optimal" and results is not None:
             opt_x = results['x']
             opt_z = results['z']
             opt_s = results['s'][1:]
             # Use numpy objective for consistency
-            opt_cost = np_objective_function(T, p0, gamma, delta, c_delivery, eps_delivery, opt_x, opt_z)
+            opt_cost = np_objective_function(T, p0, eta, delta, c_delivery, eps_delivery, opt_x, opt_z, tracking0)
     except Exception as e:
         print(f"OPT evaluation failed: {e}")
 
@@ -910,8 +926,8 @@ def evaluate_and_plot_instance0(prefix: str = 'eval_instance0'):
     print(f"Saved {outfile}")
 
     # Compute and print competitive ratios if OPT cost available
-    pald_cost = np_objective_function(T, p0, gamma, delta, c_delivery, eps_delivery, pald_x, pald_z)
-    paad_cost = np_objective_function(T, p0, gamma, delta, c_delivery, eps_delivery, paad_x, paad_z)
+    pald_cost = np_objective_function(T, p0, eta, delta, c_delivery, eps_delivery, pald_x, pald_z, tracking0)
+    paad_cost = np_objective_function(T, p0, eta, delta, c_delivery, eps_delivery, paad_x, paad_z, tracking0)
     if opt_cost is not None and opt_cost > 0:
         print(f"OPT objective: {opt_cost:.4f}")
         print(f"PAAD objective: {paad_cost:.4f}  | Competitive ratio (PAAD/OPT): {paad_cost/opt_cost:.4f}")
@@ -940,7 +956,7 @@ try:
     # Parameters to log
     params = {
         "K": K,
-        "gamma": gamma,
+        "eta": eta,
         "delta": delta,
         "S": S,
         "T": T,

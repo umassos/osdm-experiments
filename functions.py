@@ -3,6 +3,16 @@ import trace_loader
 import numpy as np
 import pickle
 import opt_sol as opt_sol
+import os
+import socket
+
+hostname = socket.gethostname()
+# use split on . to get the first part (before the dot)
+hostname_prefix = hostname.split('.')[0]
+# set pointer to license file
+os.environ['GRB_LICENSE_FILE'] = f"/nfs/obelix/users1/alechowicz/{hostname_prefix}.lic"
+
+
 
 ctx = trace_loader.prepare_exploded_from_csv("demand_traces/batch_task.csv", bucket_minutes=15)
 

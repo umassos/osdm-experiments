@@ -1,6 +1,13 @@
 import gurobipy as gp
 from gurobipy import GRB
+import os
+import socket
 
+hostname = socket.gethostname()
+# use split on . to get the first part (before the dot)
+hostname_prefix = hostname.split('.')[0]
+# set pointer to license file
+os.environ['GRB_LICENSE_FILE'] = f"/nfs/obelix/users1/alechowicz/{hostname_prefix}.lic"
 
 def optimal_solution(
     T: int,
