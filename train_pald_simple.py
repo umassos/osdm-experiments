@@ -551,14 +551,6 @@ try:
                             inst_loss = torch.relu(((pald_cost / denom) - 1.0)*1000.0)  # scale up to keep similar magnitude
                     batch_total_loss = batch_total_loss + inst_loss
 
-                    # check that the total delivery of pald is close to the total demand
-                    print("total purchased: ", torch.sum(x_torch).item(), " total delivered: ", torch.sum(z_torch).item(), " total demand: ", sum(base_seq) + sum(flex_seq))
-                    print(" pald cost: ", pald_cost.item(), " opt cost: ", None if opt_costs_all is None else opt_costs_all[global_idx], " inst loss: ", inst_loss.item())
-
-                    # # check that the torch_objective matches the np_objective_function
-                    # np_cost = np_objective_function(T, [float(v) for v in price_seq], gamma, delta, c_delivery, eps_delivery, [float(v.detach()) for v in x_torch], [float(v.detach()) for v in z_torch])
-                    # print(" np cost: ", np_cost, " pald cost: ", pald_cost.item())
-
                 else:
                     # Total cost loss
                     batch_total_loss = batch_total_loss + pald_cost

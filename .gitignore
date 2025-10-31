@@ -26,9 +26,6 @@ share/python-wheels/
 *.egg
 MANIFEST
 
-# ignore pickled files
-*.pkl
-
 # ignore images for now
 *.png
 

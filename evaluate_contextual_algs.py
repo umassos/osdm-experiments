@@ -443,9 +443,6 @@ def forward_pald(price_seq, time_seq, month_seq, forecast_seq, base_seq, flex_se
         if z_t - storage_state > x_t:
             x_t = x_t + (z_t - storage_state - x_t)
 
-        # diagnostics -- check if the currect decision will ``overfill the storage''
-        if float(storage_state.detach().item() + x_t.detach().item() - z_t.detach().item()) > S + 1e-3:
-            print(f"[warning] t={t} overfill: storage {storage_state:.3f} + x {float(x_t.detach()):.3f} - z {float(z_t.detach()):.3f} > S={S}")
         # Track previous storage (for refresh condition), then update differentiably
         prev_storage_scalar = float(storage_state.detach().item())
         storage_state = torch.clamp(storage_state + x_t - z_t, min=0.0, max=S)
@@ -682,6 +679,11 @@ def main():
         import os
         files = os.listdir(directory)
         matching_files = [f for f in files if args.trace in f and f.endswith('.pt')]
+        # if the scale factor is not 40, also match it in the file name
+        if scale_factor != 40.0:
+            matching_files = [f for f in matching_files if f"_{scale_factor}_" in f]
+        else: # if scale factor is 40, exclude files that have _<num>_ where <num> is not 40
+            matching_files = [f for f in matching_files if f"model_{args.trace}" in f]
         if not matching_files:
             print(f"No model file found in {directory} matching trace {args.trace}")
             return
@@ -724,39 +726,11 @@ def main():
     # Save detailed results to a pickle file
     # extract parameters for file name out of args.saved_model_dir
     prefix = args.saved_model_dir.split('/')[0]
-    output_file = f'eval_results/{prefix}_{args.trace}_T{args.T}_gamma{args.gamma}_delta{args.delta}_c{args.c_delivery}_eps{args.eps_delivery}_prop{proportion_base}_scale{scale_factor}.pkl'
+    output_file = f'eval_results/{prefix}_{args.trace}_T{args.T}_gamma{args.gamma}_delta{delta}_c{args.c_delivery}_eps{args.eps_delivery}_prop{args.proportion_base}_scale{scale_factor}.pkl'
     os.makedirs('eval_results', exist_ok=True)
     with open(output_file, 'wb') as f:
         pickle.dump(rows, f)
     print(f"Saved detailed results to {output_file}")
-
-    # plot CDF of the ratios
-    try:
-        import matplotlib.pyplot as plt
-        import numpy as np
-
-        def plot_cdf(data, label, color):
-            sorted_data = np.sort(data)
-            yvals = np.arange(1, len(sorted_data) + 1) / float(len(sorted_data))
-            plt.plot(sorted_data, yvals, label=label, color=color)
-
-        plt.figure(figsize=(4, 3), dpi=300)
-        if ratios_pald:
-            plot_cdf(ratios_pald, 'PALD', 'blue')
-        if ratios_paad:
-            plot_cdf(ratios_paad, 'PAAD', 'orange')
-        plt.xlabel('Comp. Ratio')
-        plt.ylabel('Cumulative Probability')
-        # legend at the bottom in two columns
-        plt.legend()
-        plt.grid(True)
-        plt.xlim(1, 4)
-        plt.ylim(0, 1)
-        plt.savefig(f'comp_ratio_cdf_{args.trace}.png')
-        plt.close()
-        print(f"Saved CDF plot to comp_ratio_cdf_{args.trace}.png")
-    except ImportError:
-        print("matplotlib not installed, skipping CDF plot.")
 
 if __name__ == "__main__":
     main()

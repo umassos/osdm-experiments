@@ -98,9 +98,9 @@ price_all, times_all, months_all, forecast_all, base_all, flex_all, Delta_all, p
 
 ## Contextual thresholds model (MonotoneHead with softplus cumulative form)
 feature_dim = 11  # handcrafted features length (see build_driver_features)
-model = ThresholdPredictor(input_dim=feature_dim, K=K+1, hidden_dims=(64, 64), 
-                           p_min=float(p_min), p_max=float(p_max), use_robust_projection=True)
-# model = ThresholdPredictor(input_dim=feature_dim, K=K+1, hidden_dims=(64, 64))
+# model = ThresholdPredictor(input_dim=feature_dim, K=K+1, hidden_dims=(64, 64), 
+#                            p_min=float(p_min), p_max=float(p_max), use_robust_projection=True)
+model = ThresholdPredictor(input_dim=feature_dim, K=K+1, hidden_dims=(64, 64))
 model_device = torch.device("cpu")
 model.to(model_device)
 model.train()
@@ -797,9 +797,6 @@ try:
                         epoch_xpre_zero += 1
                     x_t = torch.maximum(x_t, z_t - storage_state)
 
-                    # diagnostics -- check if the currect decision will ``overfill the storage''
-                    if float(storage_state.detach().item() + x_t.detach().item() - z_t.detach().item()) > S + 1e-3:
-                        print(f"[warning] t={t} overfill: storage {storage_state:.3f} + x {float(x_t.detach()):.3f} - z {float(z_t.detach()):.3f} > S={S}")
                     # Track previous storage (for refresh condition), then update differentiably
                     prev_storage_scalar = float(storage_state.detach().item())
                     storage_state = torch.clamp(storage_state + x_t - z_t, min=0.0, max=S)
@@ -837,19 +834,7 @@ try:
                 try:
                     opt_val = opt_costs_all[global_idx] if opt_costs_all is not None else None
                     if opt_val is not None and opt_val > 1e-9:
-                        cr_val = float(pald_cost.item()) / float(opt_val)
-                        # if cr_val < 1.0:
-                            # cr_val = 1.0  # numerical issues
-                            # for debugging, if the competitive ratio is less than one, print the following:
-                            # the total amount of demand (sum of base and flex)
-                            # total_demand = sum(base_seq) + sum(flex_seq)
-                            # print(f"[warning] pald cost {pald_cost.item():.3f} < opt {opt_val:.3f}, total demand {total_demand}, setting CR=1.0")
-                            # # also print the amount delivered by PALD
-                            # print(f"  total delivered: {float(torch.sum(z_torch).item()):.3f}")
-                            # # print the purchasing sequence
-                            # print(f"  purchasing: {[float(v.detach().item()) for v in x_torch]}")
-                            # # print the delivery sequence
-                            # print(f"  delivery: {[float(v.detach().item()) for v in z_torch]}")
+                        cr_val = max( float(pald_cost.item()) / float(opt_val), 1.0)
                         batch_crs.append(cr_val)
                 except Exception:
                     pass
@@ -863,14 +848,6 @@ try:
                             denom = torch.tensor(float(opt_val), dtype=torch.float32)
                             inst_loss = torch.relu(((pald_cost / denom) - 1.0)*1000.0)  # scale up to keep similar magnitude
                     batch_total_loss = batch_total_loss + inst_loss
-
-                    # # check that the total delivery of pald is close to the total demand
-                    # print("total delivered: ", torch.sum(z_torch).item(), " total demand: ", sum(base_seq) + sum(flex_seq))
-                    # print(" pald cost: ", pald_cost.item(), " opt cost: ", None if opt_costs_all is None else opt_costs_all[global_idx], " inst loss: ", inst_loss.item())
-
-                    # # check that the torch_objective matches the np_objective_function
-                    # np_cost = np_objective_function(T, [float(v) for v in price_seq], gamma, delta, c_delivery, eps_delivery, [float(v.detach()) for v in x_torch], [float(v.detach()) for v in z_torch])
-                    # print(" np cost: ", np_cost, " pald cost: ", pald_cost.item())
 
                 else:
                     # Total cost loss
@@ -1018,17 +995,6 @@ try:
                                                 p_min=float(p_min), p_max=float(p_max), device=model_device)
                 print(
                     f"[epoch {epoch} summary] loss={last_epoch_loss:.4f} "
-                    f"act_base={base_act_rate:.3f} act_flex={flex_act_rate:.3f} xpre_zero={xpre_zero_frac:.3f} "
-                    f"forced_topup_avg={avg_forced:.4f} "
-                    f"y0_b={y0b:.2f} y0_fp={y0fp:.2f} y0_fd={y0fd:.2f} "
-                    f"y2_b={y2b:.2f} y2_fp={y2fp:.2f} y2_fd={y2fd:.2f} "
-                    f"OPT_avg_p={opt_avgp:.2f} | CRs: {cr_line}\n"
-                    f"  grads[L2]: trunk={grad_info.get('trunk', 0.0):.2e} b_top={grad_info.get('base_top', 0.0):.2e} fp_top={grad_info.get('flexp_top', 0.0):.2e} fd_top={grad_info.get('flexd_top', 0.0):.2e}\n"
-                    f"  upd_norm: trunk d={upd_trunk[0]:.2e}/||w||={upd_trunk[1]:.2e} | b_top d={upd_btop[0]:.2e} fp_top d={upd_fptop[0]:.2e} fd_top d={upd_fdtop[0]:.2e}\n"
-                    f"  opt: lr={curr_lr:.2e} last_gnorm={last_gnorm:.2e} clipped_times={clip_events} trainable={sum(trainable_counts.values())}"
-                    f"  gates (mean[p25,p75]): base_top={gate_stats['base_top'][0]:.2f}[{gate_stats['base_top'][1]:.2f},{gate_stats['base_top'][2]:.2f}]"
-                    f" flexp_top={gate_stats['flexp_top'][0]:.2f}[{gate_stats['flexp_top'][1]:.2f},{gate_stats['flexp_top'][2]:.2f}]"
-                    f" flexd_top={gate_stats['flexd_top'][0]:.2f}[{gate_stats['flexd_top'][1]:.2f},{gate_stats['flexd_top'][2]:.2f}]"
                 )
 
             # After projection, update best snapshot if improved

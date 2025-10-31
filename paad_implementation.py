@@ -290,7 +290,7 @@ def get_alpha(p_min: float, p_max: float, c: float, eps: float, T: int, gamma: f
     Computes the competitive ratio alpha for the PAAD algorithm.
     """
     omega = (1 + c + eps) / (1 + eps)
-    inner_frac = ((omega*(2*(gamma+delta)/T) - p_min*c - (1+c+eps)*p_max)/((1+c+eps)*p_max + 2*(gamma+delta)))
+    inner_frac = ((-omega*(2*(gamma+delta)/T) - p_min*c - (1+c+eps)*p_max)/((1+c+eps)*p_max + 2*(gamma+delta)))
     numerator = ((1+c+eps)*p_max - (1+eps)*p_min) * np.exp(inner_frac)
     denominator = -1* ((1+c+eps)*p_max + 2*(gamma+delta))
     W_term = lambertw(numerator/denominator, k=0).real
